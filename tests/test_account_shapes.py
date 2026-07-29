@@ -863,6 +863,60 @@ def scenario_public_ipv4_beyond_eips():
               for g in gaps.all()))
 
 
+def scenario_generic_coverage():
+    """
+    The tool discovers generically but analyses specifically.
+
+    The Resource Groups Tagging API returns every type AWS knows about,
+    including ones invented after this code was written — 65 types on a real
+    account against 17 with a rule. Everything else was silently dropped, so
+    "we have no logic for this" was indistinguishable from "this is free".
+    """
+    from analysis import rules as R
+
+    gaps.clear()
+    ctx = {"resource": {"type": "SomeServiceInventedLater", "id": "x-1",
+                        "region": "ap-south-1", "monthly_cost_usd": 40.0},
+           "cost": 40.0, "cost_is_actual": False, "metrics": {},
+           "min_datapoints": 0}
+    out = R.run_rules(ctx)
+    check("Generic coverage: unreviewed spend on an unknown type is named",
+          any("No optimisation rule covers" in f["action"] for f in out),
+          str([f["action"] for f in out]))
+    check("Generic coverage: no saving is invented for it",
+          all(f["saving_usd"] is None for f in out))
+    check("Generic coverage: recorded as a coverage gap",
+          any(g.get("category") == "Coverage" for g in gaps.all()))
+
+    # Free resources must stay silent — 784 of them on a real account.
+    gaps.clear()
+    quiet = R.run_rules({"resource": {"type": "Subnet", "id": "s-1"},
+                         "cost": None, "cost_is_actual": False,
+                         "metrics": {}, "min_datapoints": 0})
+    check("Generic coverage: unpriced resources produce no noise",
+          not quiet and gaps.count() == 0, f"{len(quiet)} findings")
+
+    # Trivial spend is not worth a row.
+    gaps.clear()
+    R.run_rules({"resource": {"type": "Unknown", "id": "u-1",
+                              "monthly_cost_usd": 0.10},
+                 "cost": 0.10, "cost_is_actual": False, "metrics": {},
+                 "min_datapoints": 0})
+    check("Generic coverage: sub-dollar spend is not flagged",
+          gaps.count() == 0)
+
+    # A type WITH rules must not also get the generic row.
+    gaps.clear()
+    covered = R.run_rules({"resource": {"type": "EC2", "id": "i-1",
+                                        "state": "stopped",
+                                        "monthly_cost_usd": 5.0},
+                           "cost": 5.0, "cost_is_actual": False, "metrics": {},
+                           "min_datapoints": 0, "volumes_by_instance": {},
+                           "eips_by_instance": {}})
+    check("Generic coverage: covered types do not get a duplicate row",
+          not any("No optimisation rule covers" in f["action"] for f in covered))
+
+
 def main():
     for fn in (scenario_cur_present, scenario_commitments_held,
                scenario_partial_permissions, scenario_expired_credentials,
@@ -872,7 +926,7 @@ def main():
                scenario_commitment_risk, scenario_rightsize_target,
                scenario_public_ipv4_billing, scenario_unverified_uptime_savings,
                scenario_savings_plan_scope_label, scenario_reconciliation,
-               scenario_public_ipv4_beyond_eips,
+               scenario_public_ipv4_beyond_eips, scenario_generic_coverage,
                scenario_truncated_cur):
         try:
             fn()

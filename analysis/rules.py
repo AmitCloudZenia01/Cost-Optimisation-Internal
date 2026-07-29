@@ -268,7 +268,65 @@ def run_rules(ctx):
                     f["confidence"] = UNPRICED
         _gate_unverified_uptime(ctx, produced)
         out.extend(produced)
+
+    _flag_unreviewed_spend(ctx, out)
     return out
+
+
+# Below this a resource is not worth a row of its own; above it, spend nobody
+# looked at is worth naming even when we have nothing to suggest.
+UNREVIEWED_MIN_USD = 1.0
+
+
+def _flag_unreviewed_spend(ctx, findings):
+    """
+    Name cost-bearing resources that no rule evaluated.
+
+    The tool discovers resources generically — the Resource Groups Tagging API
+    returns every type AWS knows about, including ones invented after this code
+    was written — but analyses them specifically: 65 types discovered against 17
+    with a rule on a real account. Everything else was silently dropped, which
+    made "we have no logic for this" indistinguishable from "this is free".
+
+    This closes the loop on the attributed side, the way reconciliation closes
+    it on the unattributed side. Every dollar is then either optimised by a
+    rule, named here as unreviewed, or named by reconciliation as unattributed.
+    Nothing falls through in silence.
+
+    No saving is claimed. The finding IS that nobody looked.
+    """
+    r = ctx["resource"]
+    cost = ctx.get("cost")
+    if not cost or cost < UNREVIEWED_MIN_USD:
+        return
+    # A "Not evaluated" row already explains itself — the rule exists and said
+    # what it was missing. This is for types no rule covers at all.
+    if any(not str(f.get("action", "")).startswith("Not evaluated")
+           for f in findings):
+        return
+
+    rtype = r.get("type", "resource")
+    findings.append(finding(
+        action=f"No optimisation rule covers {rtype}",
+        phase=2, risk="N/A", saving=None,
+        evidence=[f"Monthly cost: ${cost:,.2f}",
+                  f"Resource type: {rtype}",
+                  f"Region: {r.get('region', 'unknown')}"],
+        caveats=[f"This resource costs ${cost:,.2f}/mo and no rule in this "
+                 f"report evaluated it. That is a coverage gap, not a finding "
+                 f"that it is wasteful.",
+                 "Reported so that unreviewed spend is visible rather than "
+                 "silently absent."],
+        validation_steps=[f"Review whether {rtype} spend is expected",
+                          "Ask for a rule if this type recurs across accounts"]))
+    gaps.add(
+        category="Coverage",
+        what=f"No rule for {rtype}",
+        why=f"{rtype} carries ${cost:,.2f}/mo but no rule evaluates it.",
+        how_to_fix="Add a rule for this type, or confirm the spend is expected.",
+        resource_id=r.get("id", ""), resource_type=rtype,
+        region=r.get("region", ""),
+        impact="Any saving available on this resource is not being found.")
 
 
 # Below this, the instance type's measured usage is far enough from a full

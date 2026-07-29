@@ -50,9 +50,50 @@ RIGHTSIZE_MAP = {
 }
 
 
+# Superseded families and their current-generation equivalent. Recommending
+# t2.medium -> t2.small keeps the customer two generations behind: t3.small is
+# both cheaper and faster than t2.small, so the smaller-size-same-family answer
+# is never the best one when the family itself is obsolete.
+MODERN_FAMILY = {
+    "t2": "t3", "m3": "m5", "m4": "m5", "c3": "c5", "c4": "c5",
+    "r3": "r5", "r4": "r5", "i2": "i3", "p2": "p3",
+}
+
+
 def _split(instance_type):
     parts = str(instance_type).split(".")
     return (parts[0], parts[1]) if len(parts) == 2 else (instance_type, "")
+
+
+def _memory_gb(instance_type):
+    """Memory in GiB from the live spec source, or None if unavailable."""
+    try:
+        from collectors import vantage_pricing
+        _vcpu, memory = vantage_pricing.ec2_specs(instance_type)
+        return float(memory) if memory else None
+    except Exception:
+        return None
+
+
+def _best_target(family, smaller_size, region):
+    """
+    The instance we should actually move to.
+
+    Prefers the current-generation equivalent of an obsolete family, but only
+    if AWS actually offers it in this region at that size — verified, never
+    assumed. Falls back to the same family when it does not.
+    """
+    same_family = f"{family}.{smaller_size}"
+    modern = MODERN_FAMILY.get(family)
+    if not modern:
+        return same_family, None
+
+    candidate = f"{modern}.{smaller_size}"
+    if pricing.instance_type_exists(candidate, region) is False:
+        return same_family, None
+    return candidate, (f"{family} is a previous-generation family; "
+                       f"{modern} is the current equivalent and is both "
+                       f"cheaper and faster at the same size.")
 
 
 def _ev(ctx, *pairs):
@@ -215,7 +256,7 @@ def ec2_rightsize(ctx, gated):
     smaller_size = RIGHTSIZE_MAP.get(size)
     if not smaller_size:
         return None
-    target = f"{family}.{smaller_size}"
+    target, generation_note = _best_target(family, smaller_size, ctx["region"])
     if pricing.instance_type_exists(target, ctx["region"]) is False:
         return finding(
             action=f"{r['instance_type']} is the smallest size in the {family} family",
@@ -248,9 +289,22 @@ def ec2_rightsize(ctx, gated):
                f"{ctx['cpu_threshold']}% threshold",
                f"No utilization spikes in the "
                f"{ctx['metrics'].get('spike_window_days', 90)}-day window"]
-    caveats.append(f"Memory 30d average {ram:.1f}%" if ram is not None else
-                   "Memory not reported — CloudWatch Agent is not installed, so "
-                   "memory headroom is unverified")
+    if ram is not None:
+        caveats.append(f"Memory 30d average {ram:.1f}%")
+    else:
+        # "Memory unverified" understates it when the resize halves RAM. State
+        # the actual GB delta so the reader can judge whether the workload
+        # survives it, rather than discovering the answer in production.
+        current_gb = _memory_gb(r["instance_type"])
+        target_gb = _memory_gb(target)
+        delta = (f" — RAM drops {current_gb:g} GB to {target_gb:g} GB"
+                 if current_gb and target_gb else "")
+        caveats.append(
+            f"Memory NOT measured (no CloudWatch Agent){delta}. "
+            f"Verify the workload's memory footprint before resizing; CPU "
+            f"alone cannot tell you whether it fits.")
+    if generation_note:
+        caveats.append(generation_note)
     if saving is None:
         caveats.append(f"{target} could not be priced, so no saving is claimed.")
 
@@ -1527,7 +1581,7 @@ def ebs_burst_low(ctx, gated):
 
 # ─── Account-level commitment findings ───────────────────────────────────────
 
-def commitment_findings(purchase_data, has_existing_commitments=False):
+def commitment_findings(purchase_data, has_existing_commitments=False, risk=None):
     """
     Turn AWS's own purchase recommendations into findings.
 
@@ -1550,7 +1604,11 @@ def commitment_findings(purchase_data, has_existing_commitments=False):
         out.append(finding(
             action=(f"Purchase a {term} Compute Savings Plan at "
                     f"${plan['hourly_commitment']:.2f}/hour"),
-            phase=2, risk="Low",
+            # A binding multi-year spend commitment is not low risk just because
+            # the arithmetic is certain. Risk here is about the DECISION.
+            phase=2, risk=("High" if risk and risk.get("prefer_shorter_term")
+                           else "Medium" if risk and risk.get("warnings")
+                           else "Low"),
             saving=plan["monthly_savings"],
             saving_basis=Basis(MEASURED,
                                formula=(f"AWS estimate from {plan['lookback_days']} "
@@ -1563,9 +1621,23 @@ def commitment_findings(purchase_data, has_existing_commitments=False):
                       f"Current on-demand spend in scope: ${plan['current_on_demand']:,.2f}",
                       f"Source: {plan['source']}"],
             caveats=["Computed by AWS from this account's actual usage, not from "
-                     "list prices — the most reliable figure in this report.",
+                     "list prices — the arithmetic is sound.",
+                     # The saving is reliable; the DECISION is not the same
+                     # thing. AWS is silent on whether N days of history
+                     # predicts N years, and on the fact that this same report
+                     # may recommend removing the capacity being committed to.
+                     (f"Total exposure: ${risk['exposure_usd']:,.2f} over "
+                      f"{risk['term_years']} year(s), non-refundable."
+                      if risk else ""),
                      f"A {term} commitment is binding; the saving assumes usage "
                      f"stays at or above the committed level.",
+                     *(risk.get("warnings", []) if risk else []),
+                     ("Commit LAST. Eliminate idle resources and rightsize "
+                      "first, then commit to what remains."
+                      if risk and risk.get("conflict_count") else ""),
+                     (f"Consider the one-year term instead — same discount "
+                      f"structure at a third of the exposure."
+                      if risk and risk.get("prefer_shorter_term") else ""),
                      purchase_data.get("overlap_note", "")],
             validation_steps=["Review in Billing -> Savings Plans -> Recommendations",
                               "Start with a commitment below the recommendation if "

@@ -18,6 +18,7 @@ from utils import utcnow
 from collectors import (
     cost_explorer, resource_inventory, pricing, aws_pricing, service_costs,
     cur_discovery, commitments, cur_reader, snapshots, data_transfer,
+    instance_hours,
     rds_pi, purchase_recommendations,
 )
 from collectors.metrics_auto import collect_all_metrics
@@ -90,6 +91,16 @@ def run(config_path, gcp_sa_path, aws_profile=None, role_arn=None, dry_run=False
     monthly_costs = cost_explorer.get_monthly_costs(session, months=months)
     daily_costs = cost_explorer.get_daily_costs(session, days=history_days)
     console.print(f"  [green]✓[/green] {len(monthly_costs)} monthly records, {len(daily_costs)} daily records")
+
+    # Credits are excluded from the totals above (RECORD_TYPE=Usage), so an
+    # account running on promotional credit shows its real usage. Say so
+    # explicitly — otherwise the owner sees a bill of $0 and a report of $1,400.
+    credits = cost_explorer.get_credit_coverage(session, months=months)
+    if credits.get("available") and credits.get("covered_pct", 0) >= 5:
+        console.print(f"  [yellow]! {credits['covered_pct']}% of "
+                      f"${credits['usage_usd']:,.2f} usage in {credits['month']} "
+                      f"is paid by credits — invoiced ${credits['invoiced_usd']:,.2f}. "
+                      f"Savings below are against real usage.[/yellow]")
     _log(("info", f"✓  {len(monthly_costs)} monthly cost records, {len(daily_costs)} daily records"))
 
     # Existing Reserved Instances / Savings Plans. Two accuracy controls:
@@ -187,6 +198,23 @@ def run(config_path, gcp_sa_path, aws_profile=None, role_arn=None, dry_run=False
     if resources.get("EBSSnapshot"):
         snapshots.price_snapshots(resources["EBSSnapshot"])
 
+    # Billed hours replace the 730-hour assumption. An instance that ran a
+    # fifth of the month was priced at five times its real cost, and every
+    # saving derived from it inherited the same multiple. Applied BEFORE the
+    # CUR pass so that actual billed cost, where available, still wins.
+    hours_data = instance_hours.collect(session, days=30)
+    if hours_data.get("available"):
+        adjusted = instance_hours.apply_uptime(resources, hours_data)
+        untracked = instance_hours.detect_untracked(resources, hours_data)
+        if adjusted:
+            console.print(f"  [green]OK[/green] {adjusted} instance(s) repriced "
+                          f"on measured running hours, not a full month")
+        if untracked:
+            lost = sum(u["cost_usd"] for u in untracked)
+            console.print(f"  [yellow]! {len(untracked)} instance type(s) billed "
+                          f"${lost:,.2f} but no longer exist — terminated before "
+                          f"this scan[/yellow]")
+
     # Actual billed cost overwrites list price wherever CUR supplied it.
     if cur_data.get("available"):
         applied = cur_reader.apply_actual_costs(resources, cur_data)
@@ -225,8 +253,19 @@ def run(config_path, gcp_sa_path, aws_profile=None, role_arn=None, dry_run=False
         aws_commitment_recs=bool(purchase_data.get("total_monthly_savings")))
 
     # AWS's account-level commitment recommendations, appended to the findings.
+    # Every per-resource finding produced so far, so the commitment check can
+    # see whether this report also recommends removing the capacity in question.
+    prior = [f for rec in all_recs.values()
+             for f in rec.get("phase1", []) + rec.get("phase2", [])]
+    commit_risk = purchase_recommendations.assess_commitment_risk(
+        purchase_data, monthly_costs, prior)
     commit_findings = recommender.commitment_findings(
-        purchase_data, commitment_data["has_commitments"])
+        purchase_data, commitment_data["has_commitments"], risk=commit_risk)
+    if commit_risk.get("warnings"):
+        console.print(f"  [yellow]! Commitment exposure "
+                      f"${commit_risk['exposure_usd']:,.2f} over "
+                      f"{commit_risk['term_years']}y — "
+                      f"{len(commit_risk['warnings'])} caution(s) attached[/yellow]")
     if commit_findings:
         holder = {"type": "Account", "id": account_id, "name": "Account-wide",
                   "region": "all", "recommendations": {

@@ -442,11 +442,198 @@ def scenario_cur_configured_but_empty():
     check("CUR read successfully: no spurious gap", gaps.count() == 0)
 
 
+def scenario_credit_covered_account():
+    """
+    An account paid entirely by promotional credits.
+
+    Cost Explorer returns Usage, Credit, Refund and Tax rows together. Summing
+    them nets credits against usage, so a fully-credited account showed every
+    service at roughly zero — and the `cost > 0` guard then discarded whichever
+    services went negative, leaving an arbitrary positive residue as "spend".
+    On a real account this reported $868.58 of spend against a $1,394.85 bill,
+    and data transfer as $0.00 against $868.57 of egress.
+    """
+    gaps.clear()
+    from collectors import cost_explorer
+
+    captured = {}
+
+    class CE:
+        def get_cost_and_usage(self, **kw):
+            captured.update(kw)
+            groups = [("Amazon Elastic Compute Cloud - Compute", 1316.59),
+                      ("EC2 - Other", 45.64),
+                      ("Amazon Simple Storage Service", 18.76)]
+            # Without the RECORD_TYPE filter the API would also return the
+            # credit rows that cancel these out.
+            if not _usage_only(kw.get("Filter")):
+                groups.append(("AWS Data Transfer", -868.58))
+            return {"ResultsByTime": [{
+                "TimePeriod": {"Start": "2026-06-01", "End": "2026-07-01"},
+                "Groups": [{"Keys": [k],
+                            "Metrics": {"UnblendedCost": {"Amount": str(v)},
+                                        "UsageQuantity": {"Amount": "1"}}}
+                           for k, v in groups]}]}
+
+    class Session:
+        def client(self, *a, **k):
+            return CE()
+
+    rows = cost_explorer.get_monthly_costs(Session(), months=1)
+    total = round(sum(r["cost"] for r in rows), 2)
+    check("Credit-covered: RECORD_TYPE=Usage filter is sent",
+          _usage_only(captured.get("Filter")), str(captured.get("Filter"))[:70])
+    check("Credit-covered: total is real usage, not the netted residue",
+          total == 1380.99, f"${total}")
+    check("Credit-covered: no negative row survives to be silently dropped",
+          all(r["cost"] > 0 for r in rows))
+
+
+def _usage_only(flt):
+    """True if the filter restricts RECORD_TYPE to Usage, nested or not."""
+    if not flt:
+        return False
+    if flt.get("Dimensions", {}).get("Key") == "RECORD_TYPE":
+        return flt["Dimensions"].get("Values") == ["Usage"]
+    return any(_usage_only(f) for f in flt.get("And", []))
+
+
+def scenario_part_time_instances():
+    """
+    Instances priced at 730 hours that did not run 730 hours.
+
+    An inventory scan sees an instance; the pricer multiplies its hourly rate
+    by a full month. One real instance ran 141.6 of 720 hours and was reported
+    at five times its cost — and its Graviton saving inherited the same
+    multiple. Billed hours come from Cost Explorer and are measured.
+    """
+    gaps.clear()
+    from collectors import instance_hours
+
+    hours = {"available": True, "month": "2026-06-29 to 2026-07-29",
+             "window_hours": 720,
+             "by_type": {"t3.xlarge":  {"hours": 141.6, "cost": 25.38},
+                         "t2.medium":  {"hours": 715.8, "cost": 35.51},
+                         "m5.16xlarge": {"hours": 33.7, "cost": 108.94},
+                         "c5.large":   {"hours": 500.0, "cost": 40.00}}}
+
+    resources = {"EC2": [
+        {"type": "EC2", "id": "part-time", "instance_type": "t3.xlarge",
+         "state": "running", "monthly_cost_usd": 130.82, "cost_source": "list_price"},
+        {"type": "EC2", "id": "full-time", "instance_type": "t2.medium",
+         "state": "running", "monthly_cost_usd": 36.21, "cost_source": "list_price"},
+        # two of a kind sharing 500h -> not attributable to either
+        {"type": "EC2", "id": "pair-a", "instance_type": "c5.large",
+         "state": "running", "monthly_cost_usd": 62.05, "cost_source": "list_price"},
+        {"type": "EC2", "id": "pair-b", "instance_type": "c5.large",
+         "state": "running", "monthly_cost_usd": 62.05, "cost_source": "list_price"},
+    ]}
+    instance_hours.apply_uptime(resources, hours)
+    by_id = {r["id"]: r for r in resources["EC2"]}
+
+    check("Part-time: actual billed cost is preferred over rate x uptime",
+          by_id["part-time"]["monthly_cost_usd"] == 25.38,
+          str(by_id["part-time"]["monthly_cost_usd"]))
+    check("Part-time: uptime recorded as evidence",
+          by_id["part-time"]["uptime_pct"] == 19.7)
+    check("Part-time: full-time instance left untouched",
+          by_id["full-time"]["monthly_cost_usd"] == 36.21
+          and by_id["full-time"]["cost_source"] == "list_price")
+    check("Part-time: hours are MEASURED, so the cost counts as actual",
+          prov.is_actual_cost(by_id["part-time"]))
+    check("Part-time: ambiguous split is a gap, not an even division",
+          by_id["pair-a"]["monthly_cost_usd"] == 62.05
+          and any("not attributable" in (g.get("what") or "") for g in gaps.all()))
+
+    # A brand-new instance must not inherit a predecessor's uptime.
+    gaps.clear()
+    fresh = {"EC2": [{"type": "EC2", "id": "i-new", "name": "just-launched",
+                      "instance_type": "t3.xlarge", "state": "running",
+                      "age_days": 0, "monthly_cost_usd": 130.82,
+                      "cost_source": "list_price"}]}
+    instance_hours.apply_uptime(fresh, hours)
+    check("New instance: does not inherit a terminated predecessor's uptime",
+          fresh["EC2"][0]["monthly_cost_usd"] == 130.82
+          and fresh["EC2"][0]["cost_source"] == "list_price",
+          str(fresh["EC2"][0]["monthly_cost_usd"]))
+    check("New instance: recorded as a gap rather than silently full-priced",
+          any("not measurable" in (g.get("what") or "") for g in gaps.all()))
+
+    # Instances billed but gone before the scan must not vanish silently.
+    gaps.clear()
+    missing = instance_hours.detect_untracked(resources, hours)
+    check("Terminated instances: billed-but-absent types are surfaced",
+          [m["instance_type"] for m in missing] == ["m5.16xlarge"],
+          str(missing))
+    check("Terminated instances: recorded as a coverage gap",
+          any("not in inventory" in (g.get("what") or "") for g in gaps.all()))
+
+
+def scenario_commitment_risk():
+    """
+    A Savings Plan is sound arithmetic and can still be a bad decision.
+
+    AWS computes the saving from N days of history and says nothing about
+    whether N days predicts N years, nor that the same report may recommend
+    removing the capacity being committed to.
+    """
+    from collectors import purchase_recommendations as pr
+
+    purchase = {"best_savings_plan": {
+        "term": "THREE_YEARS", "hourly_commitment": 0.204,
+        "lookback_days": "THIRTY_DAYS", "monthly_savings": 137.18,
+        "savings_pct": 25.0, "current_on_demand": 548.0, "roi_pct": 30.0,
+        "source": "ce:GetSavingsPlansPurchaseRecommendation"}}
+    falling = [{"month": "2026-04", "service": "EC2 - Compute", "cost": 900.0},
+               {"month": "2026-06", "service": "EC2 - Compute", "cost": 600.0}]
+    shrinking = [{"action": "Rightsize t2.medium -> t3.small", "saving_usd": 18.11},
+                 {"action": "Terminate idle instance", "saving_usd": 40.0}]
+
+    risk = pr.assess_commitment_risk(purchase, falling, shrinking)
+    check("Commitment: total exposure is stated, not just the monthly saving",
+          risk["exposure_usd"] == round(0.204 * 8760 * 3, 2),
+          f"${risk['exposure_usd']}")
+    check("Commitment: a 30-day lookback for a 3-year term is flagged",
+          any("thirty days" in w.lower() for w in risk["warnings"]))
+    check("Commitment: falling compute spend is flagged",
+          any("falling" in w.lower() for w in risk["warnings"]),
+          str(risk["trend"]))
+    check("Commitment: conflicting rightsizing advice is flagged",
+          risk["conflict_count"] == 2 and risk["conflict_savings"] == 58.11)
+    check("Commitment: a shorter term is preferred when evidence is thin",
+          risk["prefer_shorter_term"])
+
+    # Strong evidence, no conflicts -> no manufactured warnings.
+    solid = dict(purchase["best_savings_plan"],
+                 term="ONE_YEAR", lookback_days="SIXTY_DAYS")
+    growing = [{"month": "2026-04", "service": "EC2 - Compute", "cost": 600.0},
+               {"month": "2026-06", "service": "EC2 - Compute", "cost": 900.0}]
+    calm = pr.assess_commitment_risk({"best_savings_plan": solid}, growing, [])
+    check("Commitment: a well-evidenced plan carries no invented warnings",
+          not calm["warnings"] and not calm["prefer_shorter_term"],
+          str(calm["warnings"]))
+
+
+def scenario_rightsize_target():
+    """
+    Downsizing must not strand the customer on an obsolete family, and must say
+    what happens to memory when memory was never measured.
+    """
+    from analysis import recommender as rc
+
+    check("Rightsize: obsolete family is modernised (t2 -> t3)",
+          rc.MODERN_FAMILY.get("t2") == "t3")
+    check("Rightsize: current-generation family is left alone",
+          "m5" not in rc.MODERN_FAMILY and "t3" not in rc.MODERN_FAMILY)
+
+
 def main():
     for fn in (scenario_cur_present, scenario_commitments_held,
                scenario_partial_permissions, scenario_expired_credentials,
                scenario_empty_account, scenario_parquet_cur,
                scenario_cur_configured_but_empty,
+               scenario_credit_covered_account, scenario_part_time_instances,
+               scenario_commitment_risk, scenario_rightsize_target,
                scenario_truncated_cur):
         try:
             fn()

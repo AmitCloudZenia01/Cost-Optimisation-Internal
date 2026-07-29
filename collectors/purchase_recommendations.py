@@ -44,7 +44,14 @@ def _f(value):
         return None
 
 
-def savings_plan_recommendations(session, lookback="THIRTY_DAYS", status=None):
+# AWS offers SEVEN_DAYS, THIRTY_DAYS and SIXTY_DAYS. Thirty days is one month
+# of behaviour, which is not enough to justify a commitment measured in years —
+# a single busy month reads as a permanent baseline. Sixty is the longest AWS
+# exposes, so it is the least-bad evidence available.
+DEFAULT_LOOKBACK = "SIXTY_DAYS"
+
+
+def savings_plan_recommendations(session, lookback=DEFAULT_LOOKBACK, status=None):
     """AWS's own Savings Plan purchase recommendations."""
     out = []
     status = status if status is not None else {}
@@ -91,7 +98,7 @@ def savings_plan_recommendations(session, lookback="THIRTY_DAYS", status=None):
     return out
 
 
-def reservation_recommendations(session, lookback="THIRTY_DAYS", status=None):
+def reservation_recommendations(session, lookback=DEFAULT_LOOKBACK, status=None):
     """AWS's own Reserved Instance purchase recommendations, per service."""
     out = []
     status = status if status is not None else {}
@@ -236,4 +243,95 @@ def collect(session):
             f"Instances (${ec2_ri_amount:,.2f}/mo) discount the same compute "
             f"hours, so only the larger is counted."
         ) if (sp_amount and ec2_ri_amount) else "",
+    }
+
+
+# Actions that shrink the compute baseline a commitment is priced against.
+# Committing to capacity the same report tells you to remove is the classic
+# way a Savings Plan turns into a loss.
+_SHRINKING_ACTIONS = ("rightsize", "graviton", "terminate", "delete", "stop",
+                      "downsize", "idle", "unused")
+
+
+def assess_commitment_risk(purchase_data, monthly_costs=None, findings=None):
+    """
+    What could make a recommended commitment a bad decision.
+
+    AWS's saving figure is sound arithmetic on the last N days. It is silent on
+    whether those N days predict the next one-to-three YEARS, and silent on the
+    fact that this same report recommends removing some of the very capacity
+    being committed to. Both are stated here so the reader decides with them in
+    view rather than after signing.
+    """
+    plan = (purchase_data or {}).get("best_savings_plan")
+    if not plan:
+        return {}
+
+    years = 3 if plan.get("term") == "THREE_YEARS" else 1
+    exposure = round(plan.get("hourly_commitment", 0.0) * 8760 * years, 2)
+
+    warnings = []
+
+    # 1. Is the evidence window long enough for the commitment length?
+    lookback = str(plan.get("lookback_days", "")).replace("_", " ").lower()
+    if "thirty" in lookback or "seven" in lookback:
+        warnings.append(
+            f"Built on {lookback} of history but commits for {years} year(s). "
+            f"One busy month reads as a permanent baseline.")
+
+    # 2. Is compute spend actually growing, flat, or falling?
+    trend = _compute_trend(monthly_costs)
+    if trend and trend["direction"] == "falling":
+        warnings.append(
+            f"Compute spend is falling ({trend['detail']}). A commitment is "
+            f"priced against usage that is shrinking.")
+
+    # 3. Does this report simultaneously recommend removing that capacity?
+    conflicts = []
+    for f in (findings or []):
+        action = str(f.get("action", "")).lower()
+        if any(word in action for word in _SHRINKING_ACTIONS) and f.get("saving_usd"):
+            conflicts.append(f)
+    if conflicts:
+        total = sum(f["saving_usd"] for f in conflicts)
+        warnings.append(
+            f"This report also recommends {len(conflicts)} action(s) worth "
+            f"${total:,.2f}/mo that reduce compute. Do those first — a "
+            f"commitment locks in capacity you were about to remove.")
+
+    return {
+        "exposure_usd": exposure,
+        "term_years": years,
+        "trend": trend,
+        "conflict_count": len(conflicts),
+        "conflict_savings": round(sum(f["saving_usd"] for f in conflicts), 2),
+        "warnings": warnings,
+        # A three-year term on short or falling evidence is not defensible.
+        "prefer_shorter_term": years > 1 and bool(warnings),
+    }
+
+
+def _compute_trend(monthly_costs):
+    """Direction of compute spend across the months we have."""
+    if not monthly_costs:
+        return None
+    by_month = {}
+    for row in monthly_costs:
+        if "compute" in row.get("service", "").lower():
+            by_month[row["month"]] = by_month.get(row["month"], 0.0) + row["cost"]
+    months = sorted(by_month)
+    if len(months) < 2:
+        return None
+
+    first, last = by_month[months[0]], by_month[months[-1]]
+    if first <= 0:
+        return None
+    change = (last - first) / first * 100
+    direction = "falling" if change < -5 else "growing" if change > 5 else "flat"
+    return {
+        "direction": direction,
+        "change_pct": round(change, 1),
+        "detail": (f"{months[0]} ${first:,.2f} -> {months[-1]} ${last:,.2f}, "
+                   f"{change:+.1f}%"),
+        "months": len(months),
     }

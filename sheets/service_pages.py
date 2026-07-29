@@ -143,6 +143,29 @@ def _srec(r):
     if p1 and isinstance(p1[0], dict): return p1[0].get("action",""), p1[0].get("risk","")
     return "", ""
 
+# How a monthly cost was arrived at, in words a reader can act on.
+_COST_BASIS = {
+    "cur": "actual billed (CUR)",
+    "cost_explorer": "actual billed (Cost Explorer)",
+    "billed_hours": "list rate x measured uptime",
+    "list_price": "list price, full month",
+    # A stopped instance costs nothing to run, so "derived" — the internal
+    # provenance label — reads as jargon in a column a client will read.
+    "derived": "not billed while stopped",
+    "unavailable": "could not be priced",
+}
+
+
+def _cost_basis(r):
+    """Plain-language explanation of how this cost was arrived at."""
+    source = r.get("cost_source", "")
+    if source == "derived" and r.get("state") == "stopped":
+        return "not billed while stopped"
+    if source == "derived":
+        return "list price, full month"
+    return _COST_BASIS.get(source, source)
+
+
 # ─── Column definitions ───────────────────────────────────────────────────────
 SERVICE_COLUMNS = {
   "EC2": [
@@ -154,6 +177,7 @@ SERVICE_COLUMNS = {
     "Graviton Compat","x86-Only SW","ARM Verify SW",
     "Tag: Project","Tag: Owner","Tag: Env",
     "Hourly Cost (USD)","Monthly Cost (USD)",
+    "Uptime %","Billed Hours","Cost Basis",
     "CPU 7d%","CPU 15d%","CPU 30d%","CPU 60d%","CPU 90d%",
     "CPU Min 30d%","CPU p95 30d%","CPU Peak 30d%",
     "RAM 30d%","RAM p95 30d%","RAM Peak 30d%","Disk 30d%","Swap 30d%",
@@ -456,6 +480,11 @@ def build_ec2_rows(rl, am):
             _yn(r.get("ssm_managed")),r.get("ssm_app_count",0),gc,x86,vrfy,
             _tag(r,"Project"),_tag(r,"Owner"),_tag(r,"Environment"),
             r.get("hourly_cost_usd",""),r.get("monthly_cost_usd",""),
+            # Uptime is the evidence behind the cost: an instance billed for a
+            # fifth of the window is not a full-month instance, and a reader
+            # comparing this cost to a list price deserves to see why.
+            r.get("uptime_pct",""),r.get("billed_hours",""),
+            _cost_basis(r),
             _p(m,7,"cpu_avg_pct"),_p(m,15,"cpu_avg_pct"),_p(m,30,"cpu_avg_pct"),_p(m,60,"cpu_avg_pct"),_p(m,90,"cpu_avg_pct"),
             _p(m,30,"cpu_min_pct"),_p(m,30,"cpu_p95_pct"),_p(m,30,"cpu_max_pct"),
             _p(m,30,"mem_used_pct"),_p(m,30,"mem_p95_pct"),_p(m,30,"mem_max_pct"),

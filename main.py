@@ -426,6 +426,10 @@ def run(config_path, gcp_sa_path, aws_profile=None, role_arn=None, dry_run=False
         unresolved_prices=aws_pricing.unresolved_prices())
     console.print(f"  Data Gaps page — {gaps.count()} gaps recorded")
 
+    if build_reconciliation_page(sh, recon):
+        console.print(f"  Reconciliation page — {recon['coverage_pct']}% of the "
+                      f"bill accounted for")
+
     if build_data_transfer_page(sh, transfer):
         console.print(f"  Data Transfer page — ${transfer['total_usd']:,.2f}/mo attributed")
 

@@ -323,6 +323,38 @@ def check_analysis_before_dry_run_exit():
         ok("All analysis completes before the dry-run exit")
 
 
+def check_imported_pages_are_called():
+    """
+    Every page builder imported by main.py must actually be invoked.
+
+    The Reconciliation page was imported and never called: an edit targeted
+    `build_data_transfer_page(sh, transfer)` while the real line reads
+    `if build_data_transfer_page(...)`, so the string replace silently did
+    nothing. Everything still imported, every test still passed, and the tab
+    simply never appeared in any report.
+    """
+    src = (ROOT / "main.py").read_text()
+    imported = set(re.findall(r"from sheets[.\w]* import (build_\w+)", src))
+    imported |= set(re.findall(r"import (build_\w+)", src))
+    if not imported:
+        bad("main.py imports no page builders", "expected several")
+        return
+    uncalled = sorted(n for n in imported
+                      if not re.search(rf"\b{n}\s*\(", src.split("import", 1)[-1]
+                                       .replace(f"import {n}", "")))
+    # A name is "called" if it appears with an opening paren somewhere that is
+    # not its own import line.
+    uncalled = []
+    for name in sorted(imported):
+        calls = [m for m in re.finditer(rf"\b{name}\s*\(", src)]
+        if not calls:
+            uncalled.append(name)
+    if uncalled:
+        bad("Page builder imported but never called", ", ".join(uncalled))
+    else:
+        ok(f"All {len(imported)} imported page builders are invoked")
+
+
 def main():
     for fn in [check_imports, check_metric_keys, check_column_parity,
                check_rule_requirements, check_no_structured_values_in_sheets,
@@ -330,7 +362,8 @@ def main():
                check_pipeline_all_types, check_saving_never_exceeds_cost,
                check_no_commitment_double_count, check_undefined_names,
                check_no_tab_name_collisions,
-               check_analysis_before_dry_run_exit]:
+               check_analysis_before_dry_run_exit,
+               check_imported_pages_are_called]:
         try:
             fn()
         except Exception as e:

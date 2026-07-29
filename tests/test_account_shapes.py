@@ -779,6 +779,22 @@ def scenario_reconciliation():
     check("Reconciliation: no monthly data returns unavailable, not zero",
           rec.reconcile([], {}).get("available") is False)
 
+    # The figures shown must add up on the page. An earlier version printed
+    # attributed cost beside a coverage percentage that silently included the
+    # explained-elsewhere portion, so a reader checking the arithmetic found it
+    # broken and the tab undermined the report it was meant to vouch for.
+    gaps.clear()
+    shown = rec.reconcile(monthly, fixed,
+                          explained={"Data transfer (own tab)": 100.0})
+    total = (shown["attributed_usd"] + shown["explained_elsewhere_usd"]
+             + shown["unexplained_usd"])
+    check("Reconciliation: attributed + explained + unexplained = billed",
+          abs(total - shown["billed_usd"]) < 0.02,
+          f"{total:,.2f} vs {shown['billed_usd']:,.2f}")
+    check("Reconciliation: coverage matches the figures shown",
+          abs(shown["coverage_pct"]
+              - (shown["accounted_usd"] / shown["billed_usd"] * 100)) < 0.05)
+
 
 def scenario_public_ipv4_beyond_eips():
     """

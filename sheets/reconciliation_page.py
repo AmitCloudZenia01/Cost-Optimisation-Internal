@@ -19,7 +19,7 @@ TAB   = {"red": 0.145, "green": 0.388, "blue": 0.537}
 GOOD  = {"red": 0.851, "green": 0.918, "blue": 0.827}
 WARN  = {"red": 0.996, "green": 0.898, "blue": 0.804}
 
-NCOLS = 4
+NCOLS = 5
 
 
 def build_reconciliation_page(spreadsheet, recon):
@@ -36,10 +36,18 @@ def build_reconciliation_page(spreadsheet, recon):
 
     coverage = recon["coverage_pct"]
     rows = [["Reconciliation — this report vs the AWS bill"] + [""] * (NCOLS - 1)]
+    # Every figure on the row below must be reconcilable by the reader:
+    #   attributed + explained elsewhere + unexplained = billed
+    # An earlier version printed attributed next to a coverage percentage that
+    # included the explained-elsewhere portion, so the arithmetic did not work
+    # on the page and the tab undermined itself.
     rows.append([
-        f"AWS billed ${recon['billed_usd']:,.2f} in {recon['month']}. This report "
-        f"attributes ${recon['attributed_usd']:,.2f} of it to "
-        f"{recon['resources_priced']} specific resources — {coverage}%. "
+        f"AWS billed ${recon['billed_usd']:,.2f} in {recon['month']}. "
+        f"${recon['attributed_usd']:,.2f} is attached to "
+        f"{recon['resources_priced']} specific resources; a further "
+        f"${recon['explained_elsewhere_usd']:,.2f} is explained elsewhere in "
+        f"this report (data transfer has its own tab). Together that accounts "
+        f"for ${recon['accounted_usd']:,.2f} of the bill — {coverage}%. "
         f"The remaining ${recon['unexplained_usd']:,.2f} is broken down below. "
         f"Data transfer and per-request services bill activity rather than a "
         f"resource, so some gap is expected; a large or growing one is a charge "
@@ -48,18 +56,19 @@ def build_reconciliation_page(spreadsheet, recon):
     rows.append([""] * NCOLS)
 
     totals_hdr = len(rows)
-    rows.append(["Billed (AWS)", "Attributed to resources", "Unexplained",
-                 "Coverage %"])
+    rows.append(["Billed (AWS)", "Attributed to resources",
+                 "Explained elsewhere", "Unexplained", "Coverage %"])
     totals_row = len(rows)
     rows.append([recon["billed_usd"], recon["attributed_usd"],
-                 recon["unexplained_usd"], coverage])
+                 recon["explained_elsewhere_usd"], recon["unexplained_usd"],
+                 coverage])
     rows.append([""] * NCOLS)
 
     svc_hdr = len(rows)
-    rows.append(["Service (as AWS bills it)", "Monthly Cost (USD)", "", ""])
+    rows.append(["Service (as AWS bills it)", "Monthly Cost (USD)", "", "", ""])
     svc_start = len(rows)
     for service, cost in services:
-        rows.append([service, cost, "", ""])
+        rows.append([service, cost, "", "", ""])
     svc_end = len(rows)
 
     use_hdr = use_start = use_end = None
@@ -67,12 +76,12 @@ def build_reconciliation_page(spreadsheet, recon):
         rows.append([""] * NCOLS)
         use_hdr = len(rows)
         rows.append(["Largest usage types", "Monthly Cost (USD)",
-                     "Should map to a resource?", ""])
+                     "Should map to a resource?", "", ""])
         use_start = len(rows)
         for entry in usage:
             rows.append([entry["usage_type"], entry["cost_usd"],
                          "Yes" if entry["resource_backed"]
-                         else "No — billed activity, not a resource", ""])
+                         else "No — billed activity, not a resource", "", ""])
         use_end = len(rows)
 
     safe_update(ws, "A1", rows, value_input_option="RAW")
@@ -84,16 +93,17 @@ def build_reconciliation_page(spreadsheet, recon):
     R = [
         {"updateSheetProperties": {
             "properties": {"sheetId": sid, "tabColor": TAB}, "fields": "tabColor"}},
-        _cw(sid, 0, 1, 340), _cw(sid, 1, 2, 170), _cw(sid, 2, 3, 300), _cw(sid, 3, 4, 130),
+        _cw(sid, 0, 1, 320), _cw(sid, 1, 2, 170), _cw(sid, 2, 3, 160),
+        _cw(sid, 3, 4, 150), _cw(sid, 4, 5, 120),
         _merge(sid, 0, 1, 0, NCOLS), _rh(sid, 0, 1, 44),
         _c(sid, 0, 1, 0, NCOLS, bg=NAVY, fg=WHITE, bold=True, size=15, halign="CENTER"),
         _merge(sid, 1, 2, 0, NCOLS), _rh(sid, 1, 2, 66),
         _c(sid, 1, 2, 0, NCOLS, bg=LTBLUE, size=10, wrap=True),
         _c(sid, totals_hdr, totals_hdr + 1, 0, NCOLS, bg=NAVY, fg=WHITE,
            bold=True, size=10, halign="CENTER"),
-        _c(sid, totals_row, totals_row + 1, 0, 3, nfmt=money, bold=True,
+        _c(sid, totals_row, totals_row + 1, 0, 4, nfmt=money, bold=True,
            size=12, halign="RIGHT", bg=band),
-        _c(sid, totals_row, totals_row + 1, 3, 4, nfmt=pct, bold=True,
+        _c(sid, totals_row, totals_row + 1, 4, 5, nfmt=pct, bold=True,
            size=12, halign="RIGHT", bg=band),
         _rh(sid, totals_row, totals_row + 1, 34),
         _c(sid, svc_hdr, svc_hdr + 1, 0, NCOLS, bg=NAVY, fg=WHITE,

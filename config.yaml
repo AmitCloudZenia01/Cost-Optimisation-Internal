@@ -1,0 +1,62 @@
+# AWS Cost Report Configuration
+aws:
+  regions:
+    - us-east-1
+    - us-west-2
+    - ap-south-1
+    - eu-west-1
+  # Leave empty to auto-detect from credentials
+  account_id: ""
+  # Days of cost history to fetch
+  cost_history_days: 90
+
+pricing:
+  # Vantage Instances API token — gives real on-demand AND reserved rates, so
+  # savings are priced from live data instead of flat percentages.
+  # Leave empty and set the VANTAGE_API_TOKEN env var or a .vantage_token file
+  # instead; do NOT commit a token here. Falls back to the AWS Price List API.
+  vantage_token: ""
+
+metrics:
+  # Periods to average CloudWatch metrics over (in days).
+  # These are honoured now — the EC2/RDS sheets have 15d and 60d columns that
+  # stay blank if you remove those windows.
+  periods: [7, 15, 30, 60, 90]
+  # Spike threshold: flag any datapoint X times above the window average
+  spike_multiplier: 2.5
+  # Minimum datapoints required before a rightsizing call is made
+  min_datapoints: 100
+
+recommendations:
+  # Phase 1: only recommend if utilization is BELOW these thresholds
+  phase1:
+    cpu_max_avg: 40        # % — 30d AVERAGE CPU must be below this
+    # Averages hide peaks. These two gates judge the peak instead:
+    cpu_peak_max: 70       # % — refuse to downsize if p95 CPU exceeds this
+    target_max_utilisation: 75  # % — projected load on the SMALLER instance must stay under this
+    memory_max_avg: 50     # % — applied when the CloudWatch Agent reports memory
+    network_max_mbps: 100
+  # Phase 2: architectural improvements (Graviton, RIs, etc.)
+  phase2:
+    # Leave empty to evaluate every family with a known Graviton equivalent.
+    graviton_eligible_families:
+      - t3
+      - m5
+      - c5
+      - r5
+      - m6i
+      - c6i
+      - r6i
+    min_monthly_cost_for_ri: 200   # Only recommend RIs for resources > $200/mo
+
+google_sheets:
+  # Name format for the created sheet
+  sheet_name_format: "{account_id} AWS Cost Report {date}"
+  # Share the sheet with this email after creation (optional)
+  share_with: ""
+
+snapshots:
+  # Directory to store timestamped snapshots
+  directory: "./snapshots"
+  # Keep last N snapshots per account
+  keep_last: 10

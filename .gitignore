@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Snapshots contain real AWS account data — do not commit
+snapshots/
+*.snapshot.json
+
+# Credentials / secrets
+*credentials*.json
+*client_secret*.json
+*service-account*.json
+service_account*.json
+token.json
+*.pem
+*.key
+.env
+.env.*
+
+# API tokens
+.vantage_token
+
+# run.py copies the GCP service-account key to a tempfile in this directory.
+# tempfile names it tmpXXXXXXXX.json, which none of the patterns above match —
+# without this a real private key could be committed if the process is killed
+# before its atexit cleanup runs.
+tmp*.json
+
+# OS
+.DS_Store
+
+# Output artifacts
+*.log
+
+# Generated reports contain a client's full account detail — never commit one.
+*.xlsx
+*.xls
+*.csv

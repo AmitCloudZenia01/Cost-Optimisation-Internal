@@ -1,0 +1,14 @@
+boto3>=1.34.0
+botocore>=1.34.0
+gspread>=6.0.0
+google-auth>=2.27.0
+google-auth-oauthlib>=1.2.0
+google-api-python-client>=2.100.0
+python-dateutil>=2.9.0
+rich>=13.7.0
+pyyaml>=6.0.1
+packaging>=23.0
+
+# Optional: required only to read Parquet-format CUR exports.
+# Without it a Parquet CUR is reported as a gap rather than mis-read.
+pyarrow>=14.0.0

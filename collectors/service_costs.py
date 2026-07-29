@@ -168,14 +168,25 @@ def _price_nat(r, region):
 
 
 def _price_elastic_ip(r, region):
-    if not r.get("unattached"):
-        prov.set_cost(r, 0.0, Basis(
-            DERIVED, formula="Associated with a running resource — no idle charge",
-            provider="ec2:DescribeAddresses"))
-        return
-    price = ap.eip_idle_hourly(region)
-    if not _hourly_to_monthly(r, price, "Idle public IPv4 address"):
-        _unpriced(r, f"No published Elastic IP price for {region}.")
+    """
+    Every public IPv4 address is billed, attached or not.
+
+    Since 1 February 2024 AWS charges for ALL public IPv4 addresses — the old
+    "free while associated with a running instance" rule is gone. Zeroing
+    attached addresses hid the entire charge: on one account it left three
+    Elastic IPs at $0.00 against a real $13.86, and made "terminate this
+    instance" worth $2.01 when it was worth $5.61.
+
+    Two SKUs, same rate: IdleAddress when nothing is running behind it,
+    InUseAddress otherwise. The distinction matters because only an idle
+    address is releasable without touching a live workload.
+    """
+    idle = r.get("unattached") or r.get("attached_to_stopped")
+    price = ap.eip_idle_hourly(region) if idle else ap.eip_in_use_hourly(region)
+    label = ("Idle public IPv4 address" if idle
+             else "In-use public IPv4 address")
+    if not _hourly_to_monthly(r, price, label):
+        _unpriced(r, f"No published public IPv4 price for {region}.")
 
 
 def _price_log_group(r, region):
@@ -298,6 +309,25 @@ _USAGE_PRICED = {
 }
 
 
+def _link_eips_to_instance_state(resources):
+    """
+    Mark Elastic IPs whose instance is stopped.
+
+    AWS bills such an address at the IDLE rate even though DescribeAddresses
+    reports it as associated — the association survives the stop. It is also
+    the only kind that can be released without touching a live workload, so it
+    is the one worth recommending.
+    """
+    stopped = {r.get("id") for r in resources.get("EC2", [])
+               if r.get("state") == "stopped"}
+    if not stopped:
+        return
+    for key in ("ElasticIP", "ElasticIPs"):
+        for eip in resources.get(key, []):
+            if eip.get("attached_to") in stopped:
+                eip["attached_to_stopped"] = True
+
+
 def price_all(resources, region_default="us-east-1"):
     """
     Attach a live monthly cost to every resource that can have one.
@@ -307,6 +337,7 @@ def price_all(resources, region_default="us-east-1"):
     """
     priced = 0
     unpriced = 0
+    _link_eips_to_instance_state(resources)
 
     for resource_type, items in resources.items():
         for r in items:

@@ -627,6 +627,103 @@ def scenario_rightsize_target():
           "m5" not in rc.MODERN_FAMILY and "t3" not in rc.MODERN_FAMILY)
 
 
+def scenario_public_ipv4_billing():
+    """
+    Every public IPv4 address is billed since 1 Feb 2024, attached or not.
+
+    The pricer zeroed any attached address, which hid the whole charge: three
+    Elastic IPs read $0.00 against a real $13.86, no "release it" finding was
+    produced for the address on a stopped instance, and "terminate this
+    instance" was worth $2.01 when it was worth $5.61.
+    """
+    gaps.clear()
+    from analysis import recommender as rc
+
+    resources = {
+        "EC2": [{"type": "EC2", "id": "i-stopped", "state": "stopped"},
+                {"type": "EC2", "id": "i-running", "state": "running"}],
+        "ElasticIPs": [
+            {"type": "ElasticIPs", "id": "eip-on-stopped", "region": "ap-south-1",
+             "attached_to": "i-stopped", "unattached": False},
+            {"type": "ElasticIPs", "id": "eip-live", "region": "ap-south-1",
+             "attached_to": "i-running", "unattached": False}],
+    }
+    from collectors import service_costs
+    service_costs._link_eips_to_instance_state(resources)
+    check("Public IPv4: address on a STOPPED instance counts as idle",
+          resources["ElasticIPs"][0].get("attached_to_stopped") is True)
+    check("Public IPv4: address on a RUNNING instance is not idle",
+          not resources["ElasticIPs"][1].get("attached_to_stopped"))
+
+    # The rule must fire for the stopped-instance address, not just unattached.
+    ctx = {"resource": resources["ElasticIPs"][0], "cost": 3.65,
+           "cost_is_actual": False, "metrics": {}}
+    f = rc.eip_unattached(ctx, gated=False)
+    check("Public IPv4: a release finding is produced for it",
+          f is not None and f["saving_usd"] == 3.65,
+          str(f and f["action"]))
+    check("Public IPv4: running-instance address produces no finding",
+          rc.eip_unattached({"resource": resources["ElasticIPs"][1], "cost": 3.65,
+                             "cost_is_actual": False, "metrics": {}},
+                            gated=False) is None)
+
+    # Termination must count the address as well as the volumes.
+    ctx2 = {"resource": {"type": "EC2", "id": "i-stopped", "state": "stopped"},
+            "cost": 0.0, "cost_is_actual": False, "metrics": {},
+            "volumes_by_instance": {"i-stopped": [{"monthly_cost_usd": 2.01}]},
+            "eips_by_instance": {"i-stopped": [{"monthly_cost_usd": 3.60}]}}
+    t = rc.ec2_stopped(ctx2, gated=False)
+    check("Termination saving includes the address it releases",
+          t["saving_usd"] == 5.61, str(t["saving_usd"]))
+
+
+def scenario_unverified_uptime_savings():
+    """
+    A precise saving must not rest on unmeasured uptime.
+
+    Disclosing "this may be overstated" in a footnote while printing a
+    confident number is the failure this project exists to prevent.
+    """
+    gaps.clear()
+    from analysis import rules as R
+
+    produced = [{"action": "Move to Graviton", "saving_usd": 65.41,
+                 "confidence": ESTIMATED, "caveats": []}]
+    ctx = {"resource": {"type": "EC2", "id": "i-new", "name": "fresh",
+                        "instance_type": "t3.xlarge",
+                        "uptime_unverified": True, "type_uptime_pct": 19.7}}
+    R._gate_unverified_uptime(ctx, produced)
+    f = produced[0]
+    check("Unverified uptime: precise saving is withdrawn",
+          f["saving_usd"] is None and f["confidence"] == "Unpriced",
+          str(f["saving_usd"]))
+    check("Unverified uptime: the range is disclosed instead",
+          any("$12.89" in c and "$65.41" in c for c in f["caveats"]),
+          str(f["caveats"])[:110])
+
+    # A measured instance keeps its number.
+    kept = [{"action": "Move to Graviton", "saving_usd": 65.41,
+             "confidence": ESTIMATED, "caveats": []}]
+    R._gate_unverified_uptime({"resource": {"type": "EC2", "id": "i-old"}}, kept)
+    check("Measured uptime: saving is left intact", kept[0]["saving_usd"] == 65.41)
+
+
+def scenario_savings_plan_scope_label():
+    """
+    CurrentOnDemandSpend covers the whole lookback, so a 60-day lookback makes
+    it a two-month figure. Printed beside a monthly saving it does not
+    reconcile: $843.73 x 31.8% = $268, not the $136 claimed.
+    """
+    from analysis import recommender as rc
+    plan = {"current_on_demand": 843.73, "lookback_days": "SIXTY_DAYS"}
+    check("SP scope: 60-day spend is normalised to a month",
+          abs(rc._monthly_scope(plan) - 421.865) < 0.01,
+          str(rc._monthly_scope(plan)))
+    check("SP scope: monthly lookback is left unchanged",
+          rc._monthly_scope({"current_on_demand": 421.87,
+                             "lookback_days": "THIRTY_DAYS"}) == 421.87)
+
+
 def main():
     for fn in (scenario_cur_present, scenario_commitments_held,
                scenario_partial_permissions, scenario_expired_credentials,
@@ -634,6 +731,8 @@ def main():
                scenario_cur_configured_but_empty,
                scenario_credit_covered_account, scenario_part_time_instances,
                scenario_commitment_risk, scenario_rightsize_target,
+               scenario_public_ipv4_billing, scenario_unverified_uptime_savings,
+               scenario_savings_plan_scope_label,
                scenario_truncated_cur):
         try:
             fn()

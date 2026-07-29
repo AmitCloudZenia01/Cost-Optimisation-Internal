@@ -266,5 +266,59 @@ def run_rules(ctx):
                     f["saving_usd"] = None
                     f["saving_basis"] = None
                     f["confidence"] = UNPRICED
+        _gate_unverified_uptime(ctx, produced)
         out.extend(produced)
     return out
+
+
+# Below this, the instance type's measured usage is far enough from a full
+# month that pricing at 730 hours is a materially different answer.
+_UPTIME_DIVERGENCE_PCT = 90.0
+
+
+def _gate_unverified_uptime(ctx, produced):
+    """
+    Refuse to publish a precise saving that rests on unmeasured uptime.
+
+    An instance too new to have its own billing history keeps a full-month list
+    price, because that is the only defensible figure for it. But when the
+    instance TYPE demonstrably runs part-time, a saving computed from 730 hours
+    is not merely uncertain — it is wrong by the same multiple, and disclosing
+    that in a footnote while printing a confident number is the failure this
+    project exists to prevent.
+
+    The saving becomes Unpriced, and the caveat gives the range instead.
+    """
+    r = ctx["resource"]
+    if not r.get("uptime_unverified"):
+        return
+    type_uptime = r.get("type_uptime_pct")
+    if type_uptime is None or type_uptime >= _UPTIME_DIVERGENCE_PCT:
+        return
+
+    for f in produced:
+        saving = f.get("saving_usd")
+        if not saving:
+            continue
+        lower = round(saving * type_uptime / 100.0, 2)
+        f["saving_usd"] = None
+        f["saving_basis"] = None
+        f["confidence"] = UNPRICED
+        f.setdefault("caveats", []).append(
+            f"Saving NOT quantified: this instance is too new to have its own "
+            f"billing history, and {r.get('instance_type', 'its type')} ran only "
+            f"{type_uptime}% of the last window. At a full month the saving "
+            f"would be ${saving:,.2f}/mo; at the type's measured uptime it "
+            f"would be about ${lower:,.2f}/mo. Re-run once the instance has a "
+            f"full window of history.")
+        gaps.add(
+            category="Analysis",
+            what=f"Saving unquantified on {r.get('name') or r.get('id')}",
+            why=(f"Cost rests on an assumed full month; the instance type ran "
+                 f"{type_uptime}% of the window."),
+            how_to_fix=("Re-run once the instance has 30 days of history, or "
+                        "enable a CUR with resource IDs for per-instance hours."),
+            resource_id=r.get("id", ""),
+            resource_type=r.get("type", ""),
+            impact=(f"A saving between ${lower:,.2f} and ${saving:,.2f}/mo is "
+                    f"real but cannot be pinned down."))

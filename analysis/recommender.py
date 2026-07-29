@@ -65,6 +65,21 @@ def _split(instance_type):
     return (parts[0], parts[1]) if len(parts) == 2 else (instance_type, "")
 
 
+_LOOKBACK_MONTHS = {"SEVEN_DAYS": 7 / 30.0, "THIRTY_DAYS": 1.0, "SIXTY_DAYS": 2.0}
+
+
+def _monthly_scope(plan):
+    """
+    On-demand spend in scope, normalised to one month.
+
+    AWS reports it for the full lookback window, so the raw value changes
+    meaning when the lookback does.
+    """
+    spend = plan.get("current_on_demand") or 0.0
+    months = _LOOKBACK_MONTHS.get(str(plan.get("lookback_days", "")).upper(), 1.0)
+    return spend / months if months else spend
+
+
 def _memory_gb(instance_type):
     """Memory in GiB from the live spec source, or None if unavailable."""
     try:
@@ -204,12 +219,24 @@ def ec2_stopped(ctx, gated):
     # rates, so this is a measured figure rather than "see the EBS tab".
     volumes = ctx.get("volumes_by_instance", {}).get(r["id"], [])
     volume_cost = sum(prov.cost_of(v) or 0 for v in volumes)
+    # Terminating also releases the Elastic IP, which AWS bills at the idle
+    # rate the whole time the instance sits stopped. Counting only the volumes
+    # understated this by more than half on a real account.
+    eips = ctx.get("eips_by_instance", {}).get(r["id"], [])
+    eip_cost = sum(prov.cost_of(e) or 0 for e in eips)
+    total_cost = volume_cost + eip_cost
+
     saving, basis = None, None
-    if volumes and volume_cost:
-        saving = volume_cost
-        basis = Basis(DERIVED,
-                      formula=(f"{len(volumes)} attached EBS volume(s) "
-                               f"totalling ${volume_cost:,.2f}/mo"),
+    if total_cost:
+        parts = []
+        if volume_cost:
+            parts.append(f"{len(volumes)} attached EBS volume(s) "
+                         f"${volume_cost:,.2f}/mo")
+        if eip_cost:
+            parts.append(f"{len(eips)} Elastic IP ${eip_cost:,.2f}/mo")
+        saving = total_cost
+        basis = Basis(DERIVED, formula=" + ".join(parts) +
+                      f" = ${total_cost:,.2f}/mo",
                       provider="live pricing")
 
     return finding(
@@ -218,10 +245,12 @@ def ec2_stopped(ctx, gated):
         saving=saving, saving_basis=basis, cost_is_actual=ctx["cost_is_actual"],
         evidence=_ev(ctx, ("State", "stopped"),
                      ("Attached EBS volumes", len(volumes) or r.get("ebs_volume_count")),
-                     ("EBS cost", f"${volume_cost:,.2f}/mo" if volume_cost else None)),
+                     ("EBS cost", f"${volume_cost:,.2f}/mo" if volume_cost else None),
+                     ("Elastic IP cost", f"${eip_cost:,.2f}/mo" if eip_cost else None)),
         caveats=["Stopped instances incur no compute charge — the ongoing cost "
                  "is the attached EBS volumes and any Elastic IP.",
-                 ("The saving shown is the measured cost of the attached volumes."
+                 ("The saving shown is the measured cost of everything the "
+                  "instance still holds — volumes and address together."
                   if saving else
                   "Attached volume costs could not be resolved, so no saving is claimed.")],
         validation_steps=["Confirm with the workload owner that it is not needed",
@@ -540,25 +569,111 @@ def ebs_gp3(ctx, gated):
 
 # ─── Elastic IP ──────────────────────────────────────────────────────────────
 
-@rule("Unattached Elastic IP", ["ElasticIP", "ElasticIPs"], phase=1,
+@rule("Idle Elastic IP", ["ElasticIP", "ElasticIPs"], phase=1,
       requires=("cost",))
 def eip_unattached(ctx, gated):
-    if not ctx["resource"].get("unattached"):
+    """
+    An address is idle when nothing is running behind it.
+
+    That includes one still *associated* with a STOPPED instance: the
+    association survives the stop, DescribeAddresses reports it as attached,
+    and AWS bills it at the idle rate regardless. Checking only `unattached`
+    missed exactly that case — the most common one, since a stopped instance is
+    precisely where an unused address accumulates.
+    """
+    r = ctx["resource"]
+    stopped = r.get("attached_to_stopped")
+    if not r.get("unattached") and not stopped:
         return None
     if gated:
         return True
+
+    if stopped:
+        action = "Release Elastic IP held by a stopped instance"
+        evidence = ("Attached to", f"{r.get('attached_to', '')} (stopped)")
+        caveat = ("The instance is stopped, so nothing is served by this "
+                  "address, but AWS bills it at the idle rate for every hour "
+                  "it stays allocated.")
+        steps = ["Confirm the instance will not be restarted with this same IP",
+                 "Confirm the address is not referenced in DNS or an allow-list",
+                 "Release the allocation — or terminate the instance, which "
+                 "releases it and the attached EBS volumes together"]
+    else:
+        action = "Release unattached Elastic IP"
+        evidence = ("Association", "none")
+        caveat = ("AWS bills every public IPv4 address that is not associated "
+                  "with a running resource.")
+        steps = ["Confirm the address is not referenced in DNS or an allow-list",
+                 "Release the allocation"]
+
     return finding(
-        action="Release unattached Elastic IP",
+        action=action,
         phase=1, risk="Low", saving=ctx["cost"],
         saving_basis=Basis(DERIVED,
                            formula=f"Idle address charge ${ctx['cost']:,.2f}/mo is eliminated",
                            provider="live pricing"),
         cost_is_actual=ctx["cost_is_actual"],
-        evidence=_ev(ctx, ("Association", "none")),
-        caveats=["AWS bills every public IPv4 address that is not associated "
-                 "with a running resource."],
-        validation_steps=["Confirm the address is not referenced in DNS or an allow-list",
-                          "Release the allocation"])
+        evidence=_ev(ctx, evidence),
+        caveats=[caveat],
+        validation_steps=steps)
+
+
+# ─── API Gateway ─────────────────────────────────────────────────────────────
+
+@rule("API error rate", ["APIGateway"], phase=1,
+      requires=("cost",), priced=False)
+def apigw_failing(ctx, gated):
+    """
+    A failing API is not itself a cost finding — REST APIs bill per request, so
+    a broken one is usually cheap. It earns a place here because of what it may
+    be doing downstream: an API that provisions infrastructure and returns 5xx
+    can leave the infrastructure behind, and orphaned compute is expensive in a
+    way the API's own bill never shows.
+
+    Reported without a dollar figure, because the cost of the consequence
+    cannot be established from read-only data.
+    """
+    r = ctx["resource"]
+    m = ctx["metrics"] or {}
+    total = m.get("requests_total")
+    errors_5xx = m.get("errors_5xx")
+    latency = m.get("latency_avg_ms")
+    if not total or errors_5xx is None:
+        return None
+
+    error_pct = (errors_5xx / total * 100) if total else 0
+    slow = latency is not None and latency > 3000
+    if error_pct < 5 and not slow:
+        return None
+    if gated:
+        return True
+
+    evidence = _ev(ctx, ("Requests (30d)", int(total)),
+                   ("5xx errors", int(errors_5xx)),
+                   ("Error rate", f"{error_pct:.1f}%"),
+                   ("Average latency", f"{latency:,.0f} ms" if latency else None))
+
+    caveats = [f"{int(errors_5xx)} of {int(total)} requests failed server-side "
+               f"({error_pct:.1f}%) over 30 days."]
+    if slow:
+        caveats.append(f"Average latency {latency:,.0f} ms — long enough that "
+                       f"callers and API Gateway's own 29-second limit may be "
+                       f"timing out mid-operation.")
+    caveats.append("No saving is claimed: the API's own charge is per-request "
+                   "and negligible. The risk is what a failed call leaves "
+                   "behind if this endpoint creates resources.")
+
+    return finding(
+        action=f"Investigate failing API '{r.get('name', r.get('id'))}'",
+        phase=1, risk="Medium", saving=None,
+        evidence=evidence,
+        caveats=caveats,
+        validation_steps=[
+            "Check CloudWatch Logs for this stage to see which calls fail",
+            "If this endpoint provisions resources, reconcile what it created "
+            "against what is still running — a 5xx after creation leaves the "
+            "resource billing with nothing tracking it",
+            "Compare failure timestamps against instance launch times"])
 
 
 # ─── CloudWatch Logs ─────────────────────────────────────────────────────────
@@ -1082,6 +1197,16 @@ def generate_all_recommendations(resources, all_metrics, config, session=None,
         if attached:
             volumes_by_instance.setdefault(attached, []).append(vol)
 
+    # Same for Elastic IPs. Terminating a stopped instance releases its address
+    # too, and AWS bills that address for every hour it stays allocated — so a
+    # termination saving that counts only the volumes understates the result.
+    eips_by_instance = {}
+    for key in ("ElasticIP", "ElasticIPs"):
+        for eip in resources.get(key, []) or []:
+            attached = eip.get("attached_to")
+            if attached:
+                eips_by_instance.setdefault(attached, []).append(eip)
+
     all_recs = {}
     totals = {CONFIRMED: 0.0, ESTIMATED: 0.0}
     unpriced_findings = 0
@@ -1111,6 +1236,7 @@ def generate_all_recommendations(resources, all_metrics, config, session=None,
                 # counted twice.
                 "aws_commitment_recs": aws_commitment_recs,
                 "volumes_by_instance": volumes_by_instance,
+                "eips_by_instance": eips_by_instance,
                 **settings,
             }
 
@@ -1610,10 +1736,17 @@ def commitment_findings(purchase_data, has_existing_commitments=False, risk=None
                            else "Medium" if risk and risk.get("warnings")
                            else "Low"),
             saving=plan["monthly_savings"],
+            # CurrentOnDemandSpend covers the WHOLE lookback window, so with a
+            # 60-day lookback it is a two-month figure. Printed beside a monthly
+            # saving it invites the reader to divide one by the other and get a
+            # number that does not reconcile — state the window and the monthly
+            # equivalent so the arithmetic checks out.
             saving_basis=Basis(MEASURED,
                                formula=(f"AWS estimate from {plan['lookback_days']} "
                                         f"of billing history: {plan['savings_pct']:.1f}% "
-                                        f"off ${plan['current_on_demand']:,.2f} on-demand"),
+                                        f"off ${plan['current_on_demand']:,.2f} on-demand "
+                                        f"over that window "
+                                        f"(${_monthly_scope(plan):,.2f}/mo)"),
                                provider=plan["source"]),
             cost_is_actual=True,
             evidence=[f"Hourly commitment: ${plan['hourly_commitment']:.4f}",

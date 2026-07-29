@@ -132,6 +132,14 @@ def apply_uptime(resources, hours_data):
         age = r.get("age_days")
         if isinstance(age, (int, float)) and age * 24 < window * 0.5:
             too_new.append(r.get("name") or r.get("id"))
+            # The instance keeps its full-month list price, because that is the
+            # only defensible figure for a machine with no history. But that
+            # price is an ASSUMPTION, and any saving derived from it inherits
+            # the assumption — so flag it. Rules downstream refuse to publish a
+            # precise saving on a cost that rests on unmeasured uptime.
+            r["uptime_unverified"] = True
+            r["type_uptime_pct"] = round(
+                min(1.0, billed["hours"] / window) * 100, 1)
             continue
 
         count = counts.get(itype, 1)

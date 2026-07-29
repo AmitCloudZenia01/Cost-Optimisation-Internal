@@ -10,3 +10,14 @@ done
 echo
 [ $fail -eq 0 ] && echo "ALL SUITES PASSED" || echo "FAILURES PRESENT"
 exit $fail
+
+# The suites above inspect the code. They all pass on a report whose tabs are
+# missing, whose columns do not add up, or whose cells read as jargon — which
+# is how the Reconciliation page went three runs without existing. After
+# generating a report, read it the way a client would:
+#
+#     python3 tests/verify_report.py "<account> AWS Cost Report <date>.xlsx"
+#
+echo
+echo "Reminder: run tests/verify_report.py against the generated .xlsx."
+echo "The suites above check the code; that one checks what the client receives."

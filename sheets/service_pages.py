@@ -463,7 +463,13 @@ def build_ec2_rows(rl, am):
     for r in rl:
         m = am.get(r["id"],{}); recs = r.get("recommendations",{})
         p1a,p1r,p1c,p1v = _rec(recs,1); p2a,p2r,p2c,p2v = _rec(recs,2)
-        x86 = ", ".join(r.get("x86_only_software",[])) or "None"
+        # "None" in a cell reads as a missing value, not as "we looked and
+        # found nothing" — and those mean opposite things for a Graviton
+        # decision. Only claim nothing was found when an inventory scan
+        # actually ran; otherwise leave it blank, and let Graviton Compat say
+        # the check is required.
+        x86 = (", ".join(r.get("x86_only_software", []))
+               or ("None found" if r.get("ssm_app_count") else ""))
         vrfy = ", ".join(r.get("arm_verify_software",[])) or ""
         fam = r.get("instance_type","").split(".")[0]
         gc = ("Already Graviton" if fam in {"t4g","m7g","m6g","c7g","c6g","r7g","r6g","im4gn","is4gen"}

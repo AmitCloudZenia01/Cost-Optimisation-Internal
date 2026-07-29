@@ -328,7 +328,122 @@ def _link_eips_to_instance_state(resources):
                 eip["attached_to_stopped"] = True
 
 
-def price_all(resources, region_default="us-east-1"):
+def _price_public_ipv4(resources, region_default, actual_total=None):
+    """
+    Charge every billable public IPv4 address, not just Elastic IPs.
+
+    Since 1 February 2024 AWS bills $0.005/hr for EVERY public IPv4 address in
+    use — including ones the customer never explicitly allocated:
+
+        auto-assigned instance IPs   not an Elastic IP, still billed
+        NAT gateway addresses        one per gateway
+        internet-facing LBs          one per enabled Availability Zone
+
+    Pricing only Elastic IPs left ten such addresses unattributed on a real
+    account, invisible because each individual resource's own price looked
+    right.
+
+    `actual_total` is AWS's own PublicIPv4 charge for the month. When supplied
+    it is a hard ceiling: counting addresses today and multiplying by a monthly
+    rate assumes each existed all month, which over-attributes on any account
+    with churn — and over-attribution inflates every saving derived from it.
+    Where the count implies more than AWS billed, the real figure is allocated
+    across the addresses instead, and the basis says so.
+    """
+    price = ap.eip_in_use_hourly(region_default)
+    if price is None:
+        return 0
+    per_ip = price.amount * HOURS_PER_MONTH
+
+    # Elastic IPs are already priced as resources in their own right.
+    eip_addresses, eip_total = set(), 0.0
+    for key in ("ElasticIP", "ElasticIPs"):
+        for e in resources.get(key, []) or []:
+            if e.get("public_ip"):
+                eip_addresses.add(e["public_ip"])
+            eip_total += prov.cost_of(e) or 0.0
+
+    # Identify every OTHER billable address before charging anything.
+    holders = []
+    for r in resources.get("EC2", []) or []:
+        ip = r.get("public_ip")
+        if r.get("state") == "running" and ip and ip not in eip_addresses:
+            holders.append((r, 1, "auto-assigned"))
+
+    for r in resources.get("NATGateway", []) or []:
+        if r.get("state") != "available" or r.get("connectivity_type") == "private":
+            continue
+        ips = [i for i in str(r.get("public_ips", "")).split(",") if i.strip()]
+        holders.append((r, len(ips) or 1, "NAT gateway"))
+
+    for key in ("ELB", "ALB", "NLB", "ELBClassic"):
+        for r in resources.get(key, []) or []:
+            if r.get("scheme") != "internet-facing":
+                continue
+            az = r.get("az_count")
+            if not az:
+                # Guessing the AZ count would invent money. Say so instead.
+                gaps.add(
+                    category="Pricing",
+                    what=f"Public IPv4 for {r.get('name', r.get('id'))}",
+                    why=("The load balancer is internet-facing but its "
+                         "Availability Zone count was not collected, and AWS "
+                         "bills one public IPv4 per AZ."),
+                    how_to_fix="Re-run — az_count comes from elbv2:DescribeLoadBalancers.",
+                    resource_id=r.get("id", ""), resource_type=r.get("type", ""),
+                    impact="This load balancer's public IPv4 charge is not included.")
+                continue
+            holders.append((r, az, "internet-facing, per AZ"))
+
+    if not holders:
+        return 0
+
+    total_ips = sum(count for _r, count, _w in holders)
+    list_total = per_ip * total_ips
+
+    scale, allocated = 1.0, False
+    if actual_total is not None:
+        budget = max(0.0, actual_total - eip_total)
+        if list_total > budget + 0.01:
+            scale = (budget / list_total) if list_total else 0.0
+            allocated = True
+            gaps.add(
+                category="Pricing",
+                what="Public IPv4 charge allocated rather than counted",
+                why=(f"{total_ips} billable address(es) at a full month would be "
+                     f"${list_total:,.2f}, but AWS billed ${actual_total:,.2f} in "
+                     f"total for public IPv4 (${eip_total:,.2f} of which is "
+                     f"already on the Elastic IP rows). Addresses that existed "
+                     f"for part of the month explain the difference."),
+                how_to_fix=("Enable a CUR with resource IDs to attribute each "
+                            "address's hours to the resource that held it."),
+                impact=("Per-resource public IPv4 cost is AWS's real total shared "
+                        "across the addresses found, not a per-address measurement."))
+
+    added = 0
+    for r, count, what in holders:
+        current = prov.cost_of(r)
+        if current is None:
+            continue
+        extra = per_ip * count * scale
+        if extra <= 0:
+            continue
+        base = (r.get("cost_basis") or {}).get("formula", "base cost")
+        detail = (f"{count} public IPv4 ({what}) — AWS's billed total allocated"
+                  if allocated else
+                  f"{count} public IPv4 ({what}) x ${price.amount:,.6f}/hr x "
+                  f"{HOURS_PER_MONTH} hr")
+        prov.set_cost(r, current + extra, Basis(
+            DERIVED, formula=f"{base} + {detail} = ${extra:,.2f}",
+            unit_price=price.amount, unit="hour", provider=price.source))
+        r["public_ipv4_count"] = count
+        r["public_ipv4_cost_usd"] = round(extra, 2)
+        added += 1
+
+    return added
+
+
+def price_all(resources, region_default="us-east-1", public_ipv4_actual=None):
     """
     Attach a live monthly cost to every resource that can have one.
 
@@ -368,7 +483,10 @@ def price_all(resources, region_default="us-east-1"):
                         impact="Shown without a cost figure.")
                     unpriced += 1
 
-    return {"priced": priced, "unpriced": unpriced}
+    # Applied last, so it adds to a resolved base cost rather than racing it.
+    ipv4 = _price_public_ipv4(resources, region_default, public_ipv4_actual)
+
+    return {"priced": priced, "unpriced": unpriced, "public_ipv4_resources": ipv4}
 
 
 def apply_metric_costs(resources, all_metrics):

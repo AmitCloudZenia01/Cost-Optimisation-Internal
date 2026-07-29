@@ -103,6 +103,10 @@ def get_load_balancers(session, regions):
                         "region": region,
                         "lb_type": lb_kind,
                         "scheme": lb.get("Scheme", ""),
+                        # AWS bills one public IPv4 per AZ an internet-facing
+                        # load balancer is enabled in. Without the count the
+                        # charge cannot be priced without guessing.
+                        "az_count": len(lb.get("AvailabilityZones") or []),
                         "state": lb.get("State", {}).get("Code", ""),
                         "dns_name": lb.get("DNSName", ""),
                         "arn": lb["LoadBalancerArn"],
@@ -136,6 +140,7 @@ def get_load_balancers(session, regions):
                     "region": region,
                     "lb_type": "classic",
                     "scheme": lb.get("Scheme", ""),
+                    "az_count": len(lb.get("AvailabilityZones") or []),
                     "state": "active",
                     "dns_name": lb.get("DNSName", ""),
                     "arn": "",

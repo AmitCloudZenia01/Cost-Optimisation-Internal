@@ -298,13 +298,39 @@ def check_no_tab_name_collisions():
         ok(f"No tab-name collisions across {len(claimed)} analysis pages")
 
 
+def check_analysis_before_dry_run_exit():
+    """
+    Analysis must complete before --dry-run returns.
+
+    Reconciliation was written after the dry-run exit, so the one check that
+    proves the report against the bill never ran in the mode people use to
+    validate changes without touching Google Sheets. Anything that computes a
+    finding or records a gap belongs above that return; only presentation
+    belongs below it.
+    """
+    src = (ROOT / "main.py").read_text()
+    idx = src.find("if dry_run:")
+    if idx < 0:
+        bad("main.py has no dry-run branch", "expected `if dry_run:`")
+        return
+    after = src[idx:]
+    analysis_calls = ["reconciliation.reconcile", "recommender.generate_all",
+                      "instance_hours.apply_uptime", "service_costs.price_all"]
+    late = [c for c in analysis_calls if c in after]
+    if late:
+        bad("Analysis runs after the dry-run exit", f"{late} — --dry-run cannot validate it")
+    else:
+        ok("All analysis completes before the dry-run exit")
+
+
 def main():
     for fn in [check_imports, check_metric_keys, check_column_parity,
                check_rule_requirements, check_no_structured_values_in_sheets,
                check_duplicate_keys, check_none_comparisons, check_rule_types_exist,
                check_pipeline_all_types, check_saving_never_exceeds_cost,
                check_no_commitment_double_count, check_undefined_names,
-               check_no_tab_name_collisions]:
+               check_no_tab_name_collisions,
+               check_analysis_before_dry_run_exit]:
         try:
             fn()
         except Exception as e:

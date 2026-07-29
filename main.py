@@ -22,7 +22,7 @@ from collectors import (
     rds_pi, purchase_recommendations,
 )
 from collectors.metrics_auto import collect_all_metrics
-from analysis import recommender, differential
+from analysis import recommender, differential, reconciliation
 from analysis.provenance import gaps, CONFIRMED, ESTIMATED
 from analysis.service_registry import classify_services
 from sheets import writer, summary_page, service_pages, recommendations_page, differential_page, charts
@@ -30,6 +30,7 @@ from sheets.uncovered_services_page import build_uncovered_services_page
 from sheets.data_gaps_page import build_data_gaps_page
 from sheets.commitments_page import build_commitments_page
 from sheets.data_transfer_page import build_data_transfer_page
+from sheets.reconciliation_page import build_reconciliation_page
 
 console = Console()
 
@@ -194,7 +195,16 @@ def run(config_path, gcp_sa_path, aws_profile=None, role_arn=None, dry_run=False
     vantage_token = (config.get("pricing", {}) or {}).get("vantage_token")
     resources = pricing.enrich_with_pricing(resources, session=session,
                                             vantage_token=vantage_token)
-    priced = service_costs.price_all(resources, region_default=regions[0])
+    # AWS's own public IPv4 charge, used as a ceiling so the per-resource
+    # attribution can never exceed what was actually billed.
+    ipv4_actual = sum(cost_explorer.get_usage_type_costs(
+        session, "PublicIPv4").values()) or None
+    priced = service_costs.price_all(resources, region_default=regions[0],
+                                     public_ipv4_actual=ipv4_actual)
+    if priced.get("public_ipv4_resources"):
+        console.print(f"  [green]OK[/green] Public IPv4 charged on "
+                      f"{priced['public_ipv4_resources']} resource(s) beyond "
+                      f"Elastic IPs (auto-assigned, NAT, load balancers)")
     if resources.get("EBSSnapshot"):
         snapshots.price_snapshots(resources["EBSSnapshot"])
 
@@ -313,6 +323,25 @@ def run(config_path, gcp_sa_path, aws_profile=None, role_arn=None, dry_run=False
         console.print("  No previous snapshot found — this is the baseline.")
 
     differential.prune_old_snapshots(snapshots_dir, account_id, config["snapshots"]["keep_last"])
+
+    # Prove the report against the bill before writing a single tab. Everything
+    # else in this pipeline checks itself; this is the only check that compares
+    # the output to what AWS actually charged.
+    # Only same-period figures may offset the bill. Data transfer is measured
+    # on the same calendar month; billed instance hours are a rolling 30-day
+    # window, so folding those in would mix periods to flatter the number —
+    # the same class of error as everything else fixed here. They stay in the
+    # unexplained portion, where the Coverage gap already names them.
+    recon = reconciliation.reconcile(
+        monthly_costs, resources, transfer.get("top_usage_types"),
+        explained={"Data transfer (own tab)": transfer.get("total_usd")
+                   if transfer.get("month") == reconciliation._latest_month(monthly_costs)
+                   else 0.0})
+    if recon.get("available"):
+        colour = "green" if recon["coverage_pct"] >= 90 else "yellow"
+        console.print(f"  [{colour}]Reconciliation: ${recon['attributed_usd']:,.2f} "
+                      f"of ${recon['billed_usd']:,.2f} billed attributed to "
+                      f"resources ({recon['coverage_pct']}%)[/{colour}]")
 
     if dry_run:
         console.print("\n[yellow]Dry run — skipping Google Sheets creation.[/yellow]")

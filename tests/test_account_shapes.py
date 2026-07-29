@@ -724,6 +724,145 @@ def scenario_savings_plan_scope_label():
                              "lookback_days": "THIRTY_DAYS"}) == 421.87)
 
 
+def scenario_reconciliation():
+    """
+    The report must be provable against the bill.
+
+    Every other check here is internal and passes happily on a uniformly wrong
+    report — which is how 29 Elastic IPs sat at $0.00 against ~$105/mo of real
+    charges through five separate readings of that report. This is the only
+    check that compares output to what AWS charged.
+    """
+    gaps.clear()
+    from analysis import reconciliation as rec
+
+    monthly = [{"month": "2026-06", "service": "EC2 - Compute", "cost": 1316.59},
+               {"month": "2026-06", "service": "Amazon Virtual Private Cloud",
+                "cost": 13.86},
+               {"month": "2026-05", "service": "EC2 - Compute", "cost": 900.0}]
+
+    # Elastic IPs priced at $0.00 — the bug as it actually shipped.
+    broken = {"EC2": [{"type": "EC2", "id": "i-1", "monthly_cost_usd": 1316.59}],
+              "ElasticIPs": [{"type": "ElasticIPs", "id": "e-1",
+                              "monthly_cost_usd": 0.0}]}
+    r = rec.reconcile(monthly, broken)
+    check("Reconciliation: uses the latest complete month only",
+          r["month"] == "2026-06" and r["billed_usd"] == 1330.45,
+          f"{r['month']} ${r['billed_usd']}")
+    check("Reconciliation: unattributed spend is surfaced",
+          r["unexplained_usd"] == 13.86, str(r["unexplained_usd"]))
+    check("Reconciliation: a material gap raises a data gap",
+          any("not attributed to any resource" in (g.get("what") or "")
+              for g in gaps.all()))
+
+    # Priced correctly -> reconciles, no gap.
+    gaps.clear()
+    fixed = {"EC2": [{"type": "EC2", "id": "i-1", "monthly_cost_usd": 1316.59}],
+             "ElasticIPs": [{"type": "ElasticIPs", "id": "e-1",
+                             "monthly_cost_usd": 13.86}]}
+    ok = rec.reconcile(monthly, fixed)
+    check("Reconciliation: a correct report reconciles to 100%",
+          ok["coverage_pct"] == 100.0 and not ok["material"],
+          f"{ok['coverage_pct']}%")
+    check("Reconciliation: no gap raised when the numbers agree",
+          not any("not attributed" in (g.get("what") or "") for g in gaps.all()))
+
+    # Over-attribution is worse than under — savings built on it are inflated.
+    gaps.clear()
+    over = {"EC2": [{"type": "EC2", "id": "i-1", "monthly_cost_usd": 2000.0}]}
+    r3 = rec.reconcile(monthly, over)
+    check("Reconciliation: attributing MORE than the bill is flagged",
+          r3["unexplained_usd"] < 0
+          and any("exceeds the bill" in (g.get("what") or "") for g in gaps.all()),
+          str(r3["unexplained_usd"]))
+
+    check("Reconciliation: no monthly data returns unavailable, not zero",
+          rec.reconcile([], {}).get("available") is False)
+
+
+def scenario_public_ipv4_beyond_eips():
+    """
+    Every public IPv4 address is billed, not only Elastic IPs.
+
+    Auto-assigned instance addresses, NAT gateway addresses and one address per
+    AZ on an internet-facing load balancer are all charged since 1 Feb 2024.
+    Pricing only Elastic IPs left ten such addresses unattributed on a real
+    account, invisible because each resource's own price looked correct.
+    """
+    gaps.clear()
+    from collectors import service_costs, aws_pricing as ap
+    if not ap.price("AmazonVPC", "us-east-1",
+                    usagetype_suffix="PublicIPv4:InUseAddress",
+                    label="probe"):
+        SKIPS.append("Public IPv4 pricing (no pricing backend reachable)")
+        return
+
+    resources = {
+        "ElasticIPs": [{"type": "ElasticIPs", "id": "e-1", "public_ip": "1.1.1.1",
+                        "monthly_cost_usd": 3.65}],
+        "EC2": [
+            # holds the Elastic IP above -> must NOT be charged twice
+            {"type": "EC2", "id": "i-eip", "state": "running",
+             "public_ip": "1.1.1.1", "monthly_cost_usd": 100.0},
+            # auto-assigned -> must be charged
+            {"type": "EC2", "id": "i-auto", "state": "running",
+             "public_ip": "2.2.2.2", "monthly_cost_usd": 100.0},
+            # stopped instances hold no address
+            {"type": "EC2", "id": "i-stop", "state": "stopped",
+             "public_ip": "3.3.3.3", "monthly_cost_usd": 0.0},
+        ],
+        "NATGateway": [{"type": "NATGateway", "id": "nat-1", "state": "available",
+                        "connectivity_type": "public", "public_ips": "4.4.4.4",
+                        "monthly_cost_usd": 32.85}],
+        "ELB": [
+            {"type": "ELB", "id": "lb-1", "name": "web", "scheme": "internet-facing",
+             "az_count": 3, "monthly_cost_usd": 16.43},
+            {"type": "ELB", "id": "lb-2", "name": "internal", "scheme": "internal",
+             "az_count": 2, "monthly_cost_usd": 16.43},
+            {"type": "ELB", "id": "lb-3", "name": "unknown-az",
+             "scheme": "internet-facing", "monthly_cost_usd": 16.43},
+        ],
+    }
+    n = service_costs._price_public_ipv4(resources, "us-east-1")
+    by = {r["id"]: r for v in resources.values() for r in v}
+
+    check("Public IPv4: instance holding an Elastic IP is not charged twice",
+          "public_ipv4_count" not in by["i-eip"])
+    check("Public IPv4: auto-assigned address is charged",
+          by["i-auto"].get("public_ipv4_count") == 1)
+    check("Public IPv4: stopped instance is not charged",
+          "public_ipv4_count" not in by["i-stop"])
+    check("Public IPv4: NAT gateway address is charged",
+          by["nat-1"].get("public_ipv4_count") == 1)
+    check("Public IPv4: internet-facing LB charged once per AZ",
+          by["lb-1"].get("public_ipv4_count") == 3)
+    check("Public IPv4: internal LB is not charged",
+          "public_ipv4_count" not in by["lb-2"])
+    check("Public IPv4: unknown AZ count is a gap, never a guess",
+          "public_ipv4_count" not in by["lb-3"]
+          and any("Public IPv4 for unknown-az" in (g.get("what") or "")
+                  for g in gaps.all()))
+    check("Public IPv4: charged resources counted", n == 3, str(n))
+
+    # The bill is a hard ceiling — counting addresses assumes each existed all
+    # month, which over-attributes on any account with churn.
+    gaps.clear()
+    capped = {
+        "ElasticIPs": [{"type": "ElasticIPs", "id": "e-1", "public_ip": "1.1.1.1",
+                        "monthly_cost_usd": 3.65}],
+        "EC2": [{"type": "EC2", "id": f"i-{i}", "state": "running",
+                 "public_ip": f"10.0.0.{i}", "monthly_cost_usd": 10.0}
+                for i in range(10)],
+    }
+    service_costs._price_public_ipv4(capped, "us-east-1", actual_total=10.00)
+    charged = sum(r.get("public_ipv4_cost_usd", 0) for r in capped["EC2"])
+    check("Public IPv4: attribution never exceeds AWS's own total",
+          charged <= 10.00 - 3.65 + 0.01, f"${charged:,.2f} vs budget $6.35")
+    check("Public IPv4: allocation is disclosed, not silent",
+          any("allocated rather than counted" in (g.get("what") or "")
+              for g in gaps.all()))
+
+
 def main():
     for fn in (scenario_cur_present, scenario_commitments_held,
                scenario_partial_permissions, scenario_expired_credentials,
@@ -732,7 +871,8 @@ def main():
                scenario_credit_covered_account, scenario_part_time_instances,
                scenario_commitment_risk, scenario_rightsize_target,
                scenario_public_ipv4_billing, scenario_unverified_uptime_savings,
-               scenario_savings_plan_scope_label,
+               scenario_savings_plan_scope_label, scenario_reconciliation,
+               scenario_public_ipv4_beyond_eips,
                scenario_truncated_cur):
         try:
             fn()

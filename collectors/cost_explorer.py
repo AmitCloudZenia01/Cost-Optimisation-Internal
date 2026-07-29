@@ -236,3 +236,42 @@ def get_credit_coverage(session, months=3):
         "by_month": {m: {k: round(v, 2) for k, v in d.items()}
                      for m, d in sorted(by_month.items())},
     }
+
+
+def get_usage_type_costs(session, contains, days=35):
+    """
+    Actual billed cost per usage type for the latest complete month.
+
+    Used where a charge must be attributed but counting resources and
+    multiplying by a list rate would over-attribute — public IPv4 being the
+    case that prompted this. AWS's own figure cannot exceed AWS's own bill.
+    """
+    ce = session.client("ce", region_name="us-east-1")
+    end = utcnow().replace(day=1)
+    start = (end - timedelta(days=days)).replace(day=1)
+    try:
+        periods = _paged_cost_and_usage(
+            ce,
+            TimePeriod={"Start": start.strftime("%Y-%m-%d"),
+                        "End": end.strftime("%Y-%m-%d")},
+            Granularity="MONTHLY",
+            Metrics=["UnblendedCost", "UsageQuantity"],
+            GroupBy=[{"Type": "DIMENSION", "Key": "USAGE_TYPE"}],
+        )
+    except Exception:
+        return {}
+
+    latest = ""
+    for p in periods:
+        latest = max(latest, p["TimePeriod"]["Start"][:7])
+    out = {}
+    for p in periods:
+        if p["TimePeriod"]["Start"][:7] != latest:
+            continue
+        for g in p.get("Groups", []):
+            name = g["Keys"][0]
+            if contains.lower() not in name.lower():
+                continue
+            out[name] = out.get(name, 0.0) + float(
+                g["Metrics"]["UnblendedCost"]["Amount"])
+    return {k: round(v, 4) for k, v in out.items()}

@@ -158,6 +158,7 @@ resource detail.
 | **Data Transfer** | Inter-AZ and egress spend from actual billing |
 | **Commitments** | Existing RIs and Savings Plans, plus AWS's own purchase recommendations |
 | **All Services (Billing)** | Every service in Cost Explorer, flagging billing-only ones |
+| **Reconciliation** | This report checked against the bill — billed vs attributed, and what the gap is |
 | **Changes** | Differential against the previous run |
 | Per-service tabs | Resource-level detail, metrics and per-resource findings |
 
@@ -229,7 +230,7 @@ separately and are genuinely additive.
 
 ### What it checks
 
-**33 rules** across EC2, RDS, ElastiCache, EBS, snapshots, ELB/ALB/NLB, NAT,
+**34 rules** across EC2, RDS, ElastiCache, EBS, snapshots, ELB/ALB/NLB, NAT,
 Elastic IPs, S3, EFS, ECR, KMS, Secrets Manager, WAF, Transfer Family, EKS,
 Lambda and CloudWatch Logs — rightsizing, Graviton, commitments, idle
 resources, orphaned snapshots, missing lifecycle policies, and version
@@ -378,10 +379,10 @@ configured, so a clean machine still reports `ALL SUITES PASSED`.
 
 | Suite | Checks | Covers |
 | --- | ---: | --- |
-| `tests/audit.py` | 13 | Structural — imports, column parity, rule requirements, tab-name collisions |
+| `tests/audit.py` | 14 | Structural — imports, column parity, rule requirements, tab-name collisions, analysis-before-dry-run |
 | `tests/test_no_fabrication.py` | 23 | No hardcoded price or fallback percentage can reappear |
-| `tests/test_account_shapes.py` | 42 | Account shapes the dev account cannot reach |
-| **Total** | **78** | |
+| `tests/test_account_shapes.py` | 89 | Account shapes and billing shapes a single dev account cannot reach |
+| **Total** | **126** | |
 
 `test_account_shapes.py` simulates what a single development account never
 exercises: an account with a CUR, one already holding commitments, partial
@@ -425,6 +426,10 @@ Stated plainly, because the tool states them in its own output too:
   CodeBuild) cannot be given a per-resource monthly cost from inventory alone.
 - **Snapshot cost is an upper bound** — AWS exposes no per-snapshot incremental
   size.
+- **Uptime cannot be attributed per instance without a CUR.** Cost Explorer
+  reports billed hours per instance *type*. Where one instance of a type exists
+  the attribution is exact; where several share a type, or an instance is newer
+  than the measurement window, no uptime is claimed and a gap is recorded.
 - **Memory is invisible without the CloudWatch Agent**, which caps rightsizing
   confidence. The report names the affected instances and their combined spend.
 - **ElastiCache and Lambda runtime EOL** have no AWS API and remain dated
@@ -433,6 +438,34 @@ Stated plainly, because the tool states them in its own output too:
   lever that read-only data can confirm.
 
 ---
+
+## Reconciliation — the check that matters most
+
+Every other test in this project is internal: provenance present, columns
+aligned, no saving larger than its resource. All of them pass on a report that
+is uniformly wrong, and two did — 29 Elastic IPs at $0.00 against ~$105/mo of
+real charges, and a whole account reported at $868.58 against a $1,394.85 bill.
+
+So every run now compares itself to the invoice:
+
+```
+billed (Cost Explorer)  −  attributed to resources  −  explained elsewhere
+                                                    =  unexplained
+```
+
+Coverage appears on the Summary and gets its own tab. Some gap is normal — data
+transfer and per-request services bill activity rather than resources. A large
+or growing gap is a charge the report cannot see, and it is reported as such
+rather than absorbed.
+
+Two design notes, both learned the hard way:
+
+- The materiality test is **or**, not **and**. The Elastic IP bug was $105.85 —
+  real money, but only 1.76% of a $6,022 bill. Requiring both thresholds would
+  have missed the exact bug the check was written for.
+- Only **same-period** figures may offset the bill. Data transfer is measured on
+  the same calendar month; billed instance hours are a rolling 30-day window.
+  Folding those in to reach a flattering number would be mixing periods.
 
 ## Security
 

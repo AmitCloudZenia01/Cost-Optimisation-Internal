@@ -1707,6 +1707,69 @@ def ebs_burst_low(ctx, gated):
 
 # ─── Account-level commitment findings ───────────────────────────────────────
 
+def pattern_findings(patterns):
+    """
+    Turn measured spend shapes into account-level findings.
+
+    All Unpriced: each states what the account is doing — a scheduled burst, a
+    fast-growing line, a spend spike — with billed dollars as evidence. What it
+    is worth depends on intent only the owner knows, so no saving is claimed.
+    """
+    if not patterns.get("available"):
+        return []
+    out = []
+
+    for b in patterns.get("bursts", [])[:3]:
+        itype = b["usage_type"].split(":")[-1]
+        out.append(finding(
+            action=f"Scheduled burst: {itype} runs {b['cadence']}",
+            phase=1, risk="Low", saving=None,
+            evidence=[f"${b['cost']:,.2f} over the window, active only on: "
+                      + ", ".join(b["days"][:8]),
+                      "Source: daily billed cost by usage type"],
+            caveats=["A regular cadence on scattered days is the signature of "
+                     "a scheduled job on an on-demand instance. Spot pricing "
+                     "or a queue on a smaller always-on instance usually does "
+                     "the same work for a fraction of the rate.",
+                     "No saving is claimed: the job's requirements are not "
+                     "knowable read-only."],
+            validation_steps=["Identify the job behind the schedule",
+                              "Price the same hours on Spot",
+                              "Check whether the burst days also drive the "
+                              "data-transfer spikes — on this account they "
+                              "coincided"]))
+
+    for g in patterns.get("growing", [])[:2]:
+        out.append(finding(
+            action=f"Fast-growing spend: {g['usage_type'].split(':')[-1]} "
+                   f"+{g['growth_pct']}% within the window",
+            phase=1, risk="Medium", saving=None,
+            evidence=[f"First half ${g['first_half']:,.2f} -> second half "
+                      f"${g['second_half']:,.2f}",
+                      "Source: daily billed cost"],
+            caveats=["Growth this fast inside one window is a change in "
+                     "behaviour, not drift. If it is unintentional, catching "
+                     "it now is worth more than any rightsizing row."],
+            validation_steps=["Confirm the growth is expected",
+                              "If not, find what changed around the inflection"]))
+
+    started = patterns.get("started", [])
+    if started:
+        names = ", ".join(f"{s['usage_type'].split(':')[-1]} "
+                          f"(${s['cost']:,.2f} since {s['first_day']})"
+                          for s in started[:4])
+        out.append(finding(
+            action="New spend started mid-window",
+            phase=2, risk="Low", saving=None,
+            evidence=[names, "Source: daily billed cost"],
+            caveats=["Each of these began billing during the analysis window. "
+                     "Expected launches need no action; anything unexpected "
+                     "here is the earliest possible catch."],
+            validation_steps=["Confirm each new line was intentional"]))
+
+    return out
+
+
 def egress_findings(transfer, resources, all_metrics):
     """
     When internet egress is a top cost, name the instance serving it.

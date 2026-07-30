@@ -976,6 +976,61 @@ def scenario_credit_cliff_and_egress():
           ih._cadence(["2026-07-01", "2026-07-08"]) == "")
 
 
+def scenario_spend_patterns():
+    """
+    The time axis. Snapshots cannot see a weekly burst schedule, a line that
+    doubled mid-window, or spend that started quietly — a hand-analysis found
+    all three on a real account and the snapshot-anchored tool missed them.
+    """
+    from collectors import spend_patterns as sp
+
+    days = [f"2026-07-{d:02d}" for d in range(1, 29)]
+    by_usage = {
+        # steady base load
+        "BoxUsage:t3.medium": {d: 10.0 for d in days},
+        # weekly burst job
+        "BoxUsage:m5.16xlarge": {"2026-07-01": 42.0, "2026-07-06": 14.0,
+                                 "2026-07-13": 14.0, "2026-07-20": 24.0,
+                                 "2026-07-27": 15.0},
+        # doubles in the second half
+        "DataTransfer-Out-Bytes": {d: (5.0 if d < "2026-07-15" else 15.0)
+                                   for d in days},
+        # appears mid-window
+        "BoxUsage:t3.xlarge": {d: 4.5 for d in days if d >= "2026-07-17"},
+        # disappears mid-window
+        "BoxUsage:t3.micro": {d: 1.5 for d in days if d <= "2026-07-20"},
+    }
+    daily_total = {}
+    for series in by_usage.values():
+        for d, c in series.items():
+            daily_total[d] = daily_total.get(d, 0.0) + c
+    r = sp.analyze({"available": True, "by_usage": by_usage,
+                    "daily_total": daily_total, "window_days": 28})
+
+    check("Patterns: weekly burst is detected with its cadence",
+          any("m5.16xlarge" in b["usage_type"] and b["cadence"] == "~weekly"
+              for b in r["bursts"]), str(r["bursts"]))
+    check("Patterns: steady base load is NOT called a burst",
+          not any("t3.medium" in b["usage_type"] for b in r["bursts"]))
+    check("Patterns: mid-window growth is caught",
+          any("DataTransfer" in g["usage_type"] for g in r["growing"]),
+          str(r["growing"]))
+    check("Patterns: spend that started mid-window is named",
+          any("t3.xlarge" in x["usage_type"] for x in r["started"]))
+    check("Patterns: spend that stopped mid-window is named",
+          any("t3.micro" in x["usage_type"] for x in r["stopped"]))
+    check("Patterns: the burst day is flagged as a spike with its driver",
+          any(s["date"] == "2026-07-01"
+              and any("m5.16xlarge" in u for u, _c in s["drivers"])
+              for s in r["spikes"]), str(r["spikes"][:2]))
+
+    # Findings derived from patterns never carry an invented saving.
+    from analysis import recommender as rc
+    fs = rc.pattern_findings(r)
+    check("Patterns: findings are produced and all Unpriced",
+          fs and all(f["saving_usd"] is None for f in fs), f"{len(fs)} findings")
+
+
 def main():
     for fn in (scenario_cur_present, scenario_commitments_held,
                scenario_partial_permissions, scenario_expired_credentials,
@@ -986,7 +1041,7 @@ def main():
                scenario_public_ipv4_billing, scenario_unverified_uptime_savings,
                scenario_savings_plan_scope_label, scenario_reconciliation,
                scenario_public_ipv4_beyond_eips, scenario_generic_coverage,
-               scenario_credit_cliff_and_egress,
+               scenario_credit_cliff_and_egress, scenario_spend_patterns,
                scenario_truncated_cur):
         try:
             fn()

@@ -18,7 +18,7 @@ from utils import utcnow
 from collectors import (
     cost_explorer, resource_inventory, pricing, aws_pricing, service_costs,
     cur_discovery, commitments, cur_reader, snapshots, data_transfer,
-    instance_hours,
+    instance_hours, spend_patterns,
     rds_pi, purchase_recommendations,
 )
 from collectors.metrics_auto import collect_all_metrics
@@ -31,6 +31,7 @@ from sheets.data_gaps_page import build_data_gaps_page
 from sheets.commitments_page import build_commitments_page
 from sheets.data_transfer_page import build_data_transfer_page
 from sheets.reconciliation_page import build_reconciliation_page
+from sheets.spend_patterns_page import build_spend_patterns_page
 
 console = Console()
 
@@ -163,6 +164,21 @@ def run(config_path, gcp_sa_path, aws_profile=None, role_arn=None, dry_run=False
         console.print(f"  [green]OK[/green] ${transfer['total_usd']:,.2f}/mo of "
                       f"data transfer across {len(transfer['buckets'])} categories")
 
+    # The time axis: daily spend per usage type. Snapshots cannot see a
+    # credit cliff forming, a weekly burst schedule, or a line that doubled
+    # mid-month — every one of which a hand-analysis of this account found
+    # and this tool missed.
+    console.print("  Analysing daily spend patterns...")
+    patterns = spend_patterns.analyze(spend_patterns.collect(session))
+    if patterns.get("available"):
+        n = sum(len(patterns.get(k, [])) for k in
+                ("spikes", "bursts", "growing", "started", "stopped"))
+        if n:
+            console.print(f"  [green]OK[/green] {len(patterns.get('spikes', []))} "
+                          f"spike day(s), {len(patterns.get('bursts', []))} "
+                          f"scheduled burst(s), "
+                          f"{len(patterns.get('growing', []))} growing line(s)")
+
     # Classify active services from billing data
     covered_services, billing_only_services, _skipped = classify_services(monthly_costs)
     console.print(f"  Active services detected: {len(covered_services) + len(billing_only_services)} "
@@ -275,6 +291,7 @@ def run(config_path, gcp_sa_path, aws_profile=None, role_arn=None, dry_run=False
     # Account-level data-transfer finding: egress has no single resource, but
     # it does have an owner, and the report should name it.
     egress_recs = recommender.egress_findings(transfer, resources, all_metrics)
+    egress_recs += recommender.pattern_findings(patterns)
     if commit_risk.get("warnings"):
         console.print(f"  [yellow]! Commitment exposure "
                       f"${commit_risk['exposure_usd']:,.2f} over "
@@ -430,6 +447,9 @@ def run(config_path, gcp_sa_path, aws_profile=None, role_arn=None, dry_run=False
         unresolved_prices=aws_pricing.unresolved_prices())
     console.print(f"  Data Gaps page — {gaps.count()} gaps recorded")
 
+    if build_spend_patterns_page(sh, patterns):
+        console.print("  Spend Patterns page — the time axis")
+
     if build_reconciliation_page(sh, recon):
         console.print(f"  Reconciliation page — {recon['coverage_pct']}% of the "
                       f"bill accounted for")
@@ -454,7 +474,8 @@ def run(config_path, gcp_sa_path, aws_profile=None, role_arn=None, dry_run=False
     # to add a second tab of the same name, which Sheets rejects, and the
     # report showed a spurious "1 service tab(s) skipped" warning.
     reserved = {"Summary", "Recommendations", "Data Gaps", "Data Transfer",
-                "Commitments", "All Services (Billing)", "Changes"}
+                "Commitments", "All Services (Billing)", "Changes",
+                "Reconciliation", "Spend Patterns"}
 
     failed_pages = []
     for service in ordered_services:

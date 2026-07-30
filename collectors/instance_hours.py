@@ -217,7 +217,57 @@ def apply_uptime(resources, hours_data):
     return adjusted
 
 
-def detect_untracked(resources, hours_data):
+def _day_pattern(session, instance_types, days=30):
+    """
+    Which days each instance type actually ran, from daily billing.
+
+    A type that vanished from inventory can be a one-off experiment or a
+    recurring burst job — and the advice differs completely. On a real account
+    m5.16xlarge ran ~34 hours as weekly spikes (the 1st, 6th, 13th, 20th,
+    27th): that is a schedule, and the fix is Spot or a queue, not "someone
+    forgot an instance".
+    """
+    ce = session.client("ce", region_name="us-east-1")
+    end = utcnow()
+    try:
+        periods = _paged_cost_and_usage(
+            ce,
+            TimePeriod={"Start": (end - timedelta(days=days)).strftime("%Y-%m-%d"),
+                        "End": end.strftime("%Y-%m-%d")},
+            Granularity="DAILY",
+            Metrics=["UsageQuantity"],
+            GroupBy=[{"Type": "DIMENSION", "Key": "USAGE_TYPE"}],
+        )
+    except Exception:
+        return {}
+    wanted = set(instance_types)
+    out = {}
+    for period in periods:
+        day = period["TimePeriod"]["Start"]
+        for group in period.get("Groups", []):
+            usage_type = group["Keys"][0]
+            if "BoxUsage:" not in usage_type and "SpotUsage:" not in usage_type:
+                continue
+            itype = usage_type.split(":", 1)[1]
+            if itype not in wanted:
+                continue
+            if float(group["Metrics"]["UsageQuantity"]["Amount"]) > 0.1:
+                out.setdefault(itype, []).append(day)
+    return out
+
+
+def _cadence(days):
+    """'recurring ~weekly' when the gaps between active days cluster near 7."""
+    if len(days) < 3:
+        return ""
+    ordinals = sorted(int(d[8:10]) for d in days)
+    gaps_between = [b - a for a, b in zip(ordinals, ordinals[1:]) if b > a]
+    if gaps_between and sum(5 <= g <= 9 for g in gaps_between) >= len(gaps_between) - 1:
+        return " — recurring roughly weekly, which suggests a scheduled job"
+    return ""
+
+
+def detect_untracked(resources, hours_data, session=None):
     """
     Instance types billed last month that no longer exist in the inventory.
 
@@ -239,8 +289,19 @@ def detect_untracked(resources, hours_data):
 
     if missing:
         total = sum(m["cost_usd"] for m in missing)
-        detail = ", ".join(f"{m['instance_type']} ({m['hours']}h, "
-                           f"${m['cost_usd']:,.2f})" for m in missing[:6])
+        patterns = (_day_pattern(session, [m["instance_type"] for m in missing])
+                    if session else {})
+        parts = []
+        for m in missing[:6]:
+            days = patterns.get(m["instance_type"], [])
+            m["active_days"] = [d[5:] for d in days]
+            m["pattern"] = _cadence(days)
+            note = (f" on {len(days)} day(s): "
+                    + ", ".join(d[5:] for d in days[:6])
+                    + m["pattern"]) if days else ""
+            parts.append(f"{m['instance_type']} ({m['hours']}h, "
+                         f"${m['cost_usd']:,.2f}{note})")
+        detail = "; ".join(parts)
         gaps.add(
             category="Coverage",
             what=f"{len(missing)} instance type(s) billed but not in inventory",

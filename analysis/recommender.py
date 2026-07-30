@@ -1707,6 +1707,68 @@ def ebs_burst_low(ctx, gated):
 
 # ─── Account-level commitment findings ───────────────────────────────────────
 
+def egress_findings(transfer, resources, all_metrics):
+    """
+    When internet egress is a top cost, name the instance serving it.
+
+    Egress was the largest single line on a real bill — $868/mo for 8 TB —
+    and the report showed the total without an owner or an alternative, while
+    the instance emitting it sat on the EC2 tab with its NetworkOut column
+    quietly showing the answer. Serving static bytes from a VM is the classic
+    case where a CDN or S3 offload cuts the rate several-fold.
+
+    Unpriced by design: how much egress is cacheable depends on content we
+    cannot see. The measured cost and volume ARE the evidence; the saving is
+    the client's to bound.
+    """
+    if not transfer.get("available"):
+        return []
+    egress_usd = transfer.get("egress_usd") or 0.0
+    egress_gb = transfer.get("egress_gb") or 0.0
+    if egress_usd < 50:
+        return []
+
+    # Rank running instances by measured NetworkOut to find the emitter.
+    emitters = []
+    for r in resources.get("EC2", []):
+        if r.get("state") != "running":
+            continue
+        m = (all_metrics.get(r.get("id")) or {}).get("periods", {}).get("30d", {})
+        out = m.get("network_out_bytes")
+        if out:
+            emitters.append((out, r))
+    emitters.sort(key=lambda t: -t[0])
+
+    top_share = None
+    top = None
+    total_out = sum(o for o, _r in emitters)
+    if emitters and total_out:
+        top = emitters[0][1]
+        top_share = emitters[0][0] / total_out * 100
+
+    evidence = [f"Internet egress: ${egress_usd:,.2f}/mo for "
+                f"{egress_gb / 1024:,.1f} TB ({transfer.get('month', '')})",
+                "Source: Cost Explorer usage types — actual billed cost"]
+    caveats = ["How much of this is cacheable static content cannot be "
+               "determined read-only, so no dollar saving is claimed. At CDN "
+               "rates the same volume typically costs a fraction of "
+               "EC2-to-internet egress, and cache hits cost less again."]
+    steps = ["Identify what content the top emitter serves",
+             "Move static/media assets to S3 behind CloudFront (or another CDN)",
+             "Re-run this report a month later — the egress line is measured, "
+             "so the change will be visible in billing, not estimated"]
+    action = "Reduce internet egress served from EC2"
+    if top is not None and top_share and top_share >= 50:
+        action = (f"Serve {egress_gb / 1024:,.1f} TB/mo via CDN instead of "
+                  f"{top.get('name') or top.get('id')}")
+        evidence.append(f"{top.get('name') or top.get('id')} emits "
+                        f"{top_share:.0f}% of measured EC2 NetworkOut")
+
+    return [finding(
+        action=action, phase=1, risk="Low", saving=None,
+        evidence=evidence, caveats=caveats, validation_steps=steps)]
+
+
 def commitment_findings(purchase_data, has_existing_commitments=False, risk=None):
     """
     Turn AWS's own purchase recommendations into findings.

@@ -74,7 +74,7 @@ def collect(session, days=30):
             TimePeriod={"Start": start.strftime("%Y-%m-%d"),
                         "End": end.strftime("%Y-%m-%d")},
             Granularity="MONTHLY",
-            Metrics=["UnblendedCost"],
+            Metrics=["UnblendedCost", "UsageQuantity"],
             GroupBy=[{"Type": "DIMENSION", "Key": "USAGE_TYPE"}],
         )
     except Exception as e:
@@ -91,6 +91,7 @@ def collect(session, days=30):
     # Use the most recent complete month so partial-month data cannot skew it.
     latest_month = ""
     by_usage = {}
+    qty_by_usage = {}
     for period in periods:
         month = period["TimePeriod"]["Start"][:7]
         latest_month = max(latest_month, month)
@@ -102,6 +103,8 @@ def collect(session, days=30):
             cost = float(group["Metrics"]["UnblendedCost"]["Amount"])
             if cost > 0:
                 by_usage[usage_type] = by_usage.get(usage_type, 0.0) + cost
+                qty_by_usage[usage_type] = (qty_by_usage.get(usage_type, 0.0)
+                    + float(group["Metrics"].get("UsageQuantity", {}).get("Amount", 0)))
 
     transfer = {u: c for u, c in by_usage.items()
                 if any(m.lower() in u.lower() for m in _TRANSFER_MARKERS)}
@@ -124,10 +127,21 @@ def collect(session, days=30):
 
     top = sorted(transfer.items(), key=lambda kv: kv[1], reverse=True)[:20]
 
+    # GB of internet egress, so the CDN recommendation can name a measured
+    # volume ("6.6 TB served from EC2") rather than only a dollar figure.
+    egress_cost = sum(c for u, c in transfer.items()
+                      if _bucket(u) == "Internet egress")
+    egress_gb = sum(qty_by_usage.get(u, 0.0) for u in transfer
+                    if _bucket(u) == "Internet egress")
+
     return {
         "available": True,
         "month": latest_month,
         "total_usd": round(sum(transfer.values()), 2),
+        "egress_usd": round(egress_cost, 2),
+        "egress_gb": round(egress_gb, 1),
         "buckets": bucket_rows,
-        "top_usage_types": [{"usage_type": u, "cost_usd": round(c, 2)} for u, c in top],
+        "top_usage_types": [{"usage_type": u, "cost_usd": round(c, 2),
+                             "gb": round(qty_by_usage.get(u, 0.0), 1)}
+                            for u, c in top],
     }

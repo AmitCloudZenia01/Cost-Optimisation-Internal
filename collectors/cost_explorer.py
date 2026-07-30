@@ -214,6 +214,53 @@ def get_credit_coverage(session, months=3):
     covered = -by_month[latest]["credit"]
     pct = round(covered / usage * 100, 1) if usage > 0 else 0.0
 
+    # The complete-month view answers "what happened"; it cannot see credits
+    # running out RIGHT NOW. On a real account June showed 100% coverage while
+    # July month-to-date was already only half covered — the single most
+    # important fact for that client, and invisible to any closed-month query.
+    mtd = {}
+    try:
+        today = utcnow()
+        if today.day > 3:                      # too early in a month is noise
+            periods_mtd = _paged_cost_and_usage(
+                ce, record_types=None,
+                TimePeriod={"Start": today.replace(day=1).strftime("%Y-%m-%d"),
+                            "End": today.strftime("%Y-%m-%d")},
+                Granularity="MONTHLY",
+                Metrics=["UnblendedCost"],
+                GroupBy=[{"Type": "DIMENSION", "Key": "RECORD_TYPE"}],
+            )
+            u = c = 0.0
+            for period in periods_mtd:
+                for group in period.get("Groups", []):
+                    amt = float(group["Metrics"]["UnblendedCost"]["Amount"])
+                    if group["Keys"][0] == "Usage":
+                        u += amt
+                    elif group["Keys"][0] in ("Credit", "Refund"):
+                        c += amt
+            if u > 0:
+                mtd = {"month": today.strftime("%Y-%m"),
+                       "usage_usd": round(u, 2),
+                       "credit_usd": round(-c, 2),
+                       "net_usd": round(max(0.0, u + c), 2),
+                       "covered_pct": round(-c / u * 100, 1)}
+    except Exception:
+        mtd = {}
+
+    if mtd and pct >= 95 and mtd["covered_pct"] < pct - 10:
+        gaps.add(
+            category="Cost data",
+            what="Credits are running out NOW",
+            why=(f"{latest} was {pct}% credit-covered, but {mtd['month']} "
+                 f"month-to-date is only {mtd['covered_pct']}% covered: "
+                 f"${mtd['usage_usd']:,.2f} usage against "
+                 f"${mtd['credit_usd']:,.2f} of credits, leaving "
+                 f"${mtd['net_usd']:,.2f} net so far."),
+            how_to_fix=("Treat every saving in this report as money that will "
+                        "appear on the next invoice, not a hypothetical."),
+            impact=(f"At current usage this account pays roughly "
+                    f"${usage:,.0f}/mo at full price once credits are gone."))
+
     if pct >= 5:
         gaps.add(
             category="Cost data",
@@ -229,6 +276,7 @@ def get_credit_coverage(session, months=3):
     return {
         "available": True,
         "month": latest,
+        "mtd": mtd,
         "usage_usd": round(usage, 2),
         "credit_usd": round(covered, 2),
         "invoiced_usd": round(max(0.0, usage - covered), 2),

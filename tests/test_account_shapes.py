@@ -933,6 +933,49 @@ def scenario_generic_coverage():
           not any("No optimisation rule covers" in f["action"] for f in covered))
 
 
+def scenario_credit_cliff_and_egress():
+    """
+    Two findings a competing hand-analysis caught and this tool missed.
+
+    1. Credits running out NOW: the complete-month view showed 100% coverage
+       while the running month was only half covered. The cliff is the single
+       most important fact for that client and no closed-month query sees it.
+    2. Egress with an owner: $868/mo of internet egress was reported as a
+       total, while the instance emitting 100% of measured NetworkOut sat on
+       another tab. A number without an owner produces no action.
+    """
+    from analysis import recommender as rc
+
+    transfer = {"available": True, "egress_usd": 868.15, "egress_gb": 8043.9,
+                "month": "2026-06"}
+    resources = {"EC2": [
+        {"type": "EC2", "id": "i-big", "name": "server.accofin.in",
+         "state": "running"},
+        {"type": "EC2", "id": "i-small", "name": "payment-app",
+         "state": "running"}]}
+    metrics = {"i-big": {"periods": {"30d": {"network_out_bytes": 9_000_000.0}}},
+               "i-small": {"periods": {"30d": {"network_out_bytes": 90_000.0}}}}
+    out = rc.egress_findings(transfer, resources, metrics)
+    check("Egress: the dominant emitter is named in the action",
+          out and "server.accofin.in" in out[0]["action"], str(out and out[0]["action"]))
+    check("Egress: volume is stated in TB, measured not estimated",
+          any("TB" in e for e in out[0]["evidence"]))
+    check("Egress: saving is Unpriced — cacheability is unknowable read-only",
+          out[0]["saving_usd"] is None)
+    check("Egress: trivial egress produces no finding",
+          rc.egress_findings({"available": True, "egress_usd": 4.0,
+                              "egress_gb": 30.0}, resources, metrics) == [])
+
+    from collectors import instance_hours as ih
+    check("Burst cadence: weekly spikes are recognised",
+          "weekly" in ih._cadence(["2026-07-01", "2026-07-06", "2026-07-13",
+                                   "2026-07-20", "2026-07-27"]))
+    check("Burst cadence: consecutive days are not called a schedule",
+          ih._cadence(["2026-07-01", "2026-07-02", "2026-07-03"]) == "")
+    check("Burst cadence: two days is not a pattern",
+          ih._cadence(["2026-07-01", "2026-07-08"]) == "")
+
+
 def main():
     for fn in (scenario_cur_present, scenario_commitments_held,
                scenario_partial_permissions, scenario_expired_credentials,
@@ -943,6 +986,7 @@ def main():
                scenario_public_ipv4_billing, scenario_unverified_uptime_savings,
                scenario_savings_plan_scope_label, scenario_reconciliation,
                scenario_public_ipv4_beyond_eips, scenario_generic_coverage,
+               scenario_credit_cliff_and_egress,
                scenario_truncated_cur):
         try:
             fn()

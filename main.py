@@ -215,7 +215,8 @@ def run(config_path, gcp_sa_path, aws_profile=None, role_arn=None, dry_run=False
     hours_data = instance_hours.collect(session, days=30)
     if hours_data.get("available"):
         adjusted = instance_hours.apply_uptime(resources, hours_data)
-        untracked = instance_hours.detect_untracked(resources, hours_data)
+        untracked = instance_hours.detect_untracked(resources, hours_data,
+                                                    session=session)
         if adjusted:
             console.print(f"  [green]OK[/green] {adjusted} instance(s) repriced "
                           f"on measured running hours, not a full month")
@@ -271,15 +272,18 @@ def run(config_path, gcp_sa_path, aws_profile=None, role_arn=None, dry_run=False
         purchase_data, monthly_costs, prior)
     commit_findings = recommender.commitment_findings(
         purchase_data, commitment_data["has_commitments"], risk=commit_risk)
+    # Account-level data-transfer finding: egress has no single resource, but
+    # it does have an owner, and the report should name it.
+    egress_recs = recommender.egress_findings(transfer, resources, all_metrics)
     if commit_risk.get("warnings"):
         console.print(f"  [yellow]! Commitment exposure "
                       f"${commit_risk['exposure_usd']:,.2f} over "
                       f"{commit_risk['term_years']}y — "
                       f"{len(commit_risk['warnings'])} caution(s) attached[/yellow]")
-    if commit_findings:
+    if commit_findings or egress_recs:
         holder = {"type": "Account", "id": account_id, "name": "Account-wide",
                   "region": "all", "recommendations": {
-                      "phase1": [], "phase2": commit_findings,
+                      "phase1": egress_recs, "phase2": commit_findings,
                       "lifecycle_warnings": [], "savings_phase1_usd": 0,
                       "savings_phase2_usd": sum(f["saving_usd"] or 0 for f in commit_findings)}}
         resources.setdefault("Commitments", []).append(holder)
